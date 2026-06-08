@@ -127,21 +127,20 @@ cmd_rm() {
 }
 
 cmd_update() {
+  local stamp="$CCS_STATE/install.sha256"
   if [[ "${1:-}" == "--version" ]]; then
-    local self="$XDG_CONFIG_HOME/ccs/ccs.sh" remote remote_sha local_sha
-    remote=$(curl -fsSL "$REPO/ccs.sh") || die "failed to check latest version"
+    local remote remote_sha
+    remote=$(curl -fsSL "$REPO/install.sh") || die "failed to check latest version"
     remote_sha=$(echo "$remote" | shasum -a 256 | cut -d' ' -f1)
-    local_sha=$(shasum -a 256 "$self" | cut -d' ' -f1)
-    if [[ "$remote_sha" == "$local_sha" ]]; then
-      echo "ccs is up to date (sha256 ${local_sha:0:7})"
+    if [[ -f "$stamp" ]] && [[ "$(cat "$stamp")" == "$remote_sha" ]]; then
+      echo "ccs is up to date"
     else
-      local remote_ver
-      remote_ver=$(echo "$remote" | bash -s version 2>/dev/null) || true
-      echo "update available: ${remote_ver:-latest} — run: ccs update"
+      echo "update available — run: ccs update"
     fi
     return
   fi
   curl -fsSL "$REPO/install.sh" | bash
+  curl -fsSL "$REPO/install.sh" | shasum -a 256 | cut -d' ' -f1 > "$stamp"
 }
 
 cmd_help() {

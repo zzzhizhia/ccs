@@ -5,14 +5,13 @@ Quickly switch between Claude Code API profiles (different API keys, base URLs, 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zzzhizhia/ccs/main/install.sh | bash
-source ~/.zshenv
+curl -fsSL https://raw.githubusercontent.com/zzzhizhia/ccs/main/install.sh | bash && exec $SHELL
 ```
 
 Or clone and run locally:
 
 ```bash
-git clone https://github.com/zzzhizhia/ccs.git && cd ccs && ./install.sh && source ~/.zshenv
+git clone https://github.com/zzzhizhia/ccs.git && cd ccs && ./install.sh && exec $SHELL
 ```
 
 Done. Open a new terminal, or `exec $SHELL`.

@@ -112,4 +112,4 @@ esac
 
 echo
 echo "ccs installed for $sh."
-echo "Activate now:  source $rc"
+echo "Activate now:  exec \$SHELL"

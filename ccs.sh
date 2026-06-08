@@ -8,6 +8,7 @@
 set -euo pipefail
 
 VERSION="0.1.0"
+REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
@@ -125,6 +126,16 @@ cmd_rm() {
   [[ "$(cmd_current)" == "$name" ]] && rm -f "$CURRENT"
 }
 
+cmd_update() {
+  local self="${CCS_SELF:-$XDG_CONFIG_HOME/ccs/ccs.sh}"
+  local tmp="$(mktemp)"
+  curl -fsSL "$REPO/ccs.sh" -o "$tmp" || die "failed to download update"
+  local new_version
+  new_version=$(bash "$tmp" version 2>/dev/null) || die "downloaded script is not valid"
+  mv "$tmp" "$self" && chmod +x "$self"
+  echo "✓ ccs: updated to $new_version"
+}
+
 cmd_help() {
   cat <<EOF
 ccs — Claude Code Switch
@@ -139,6 +150,7 @@ Usage:
   ccs rm <name>         Remove a profile
   ccs show [<name>]     Show a profile's env file (sensitive keys masked)
   ccs unset             Clear all Claude Code env vars
+  ccs update            Update ccs to latest version
   ccs path              Print profiles directory
   ccs version           Print version
   ccs help              This message
@@ -165,6 +177,7 @@ case "$cmd" in
   unset|off)            cmd_unset ;;
   show)                 cmd_show "$@" ;;
   path)                 echo "$CCS_DIR" ;;
+  update)               cmd_update ;;
   version|-V|--version) echo "ccs $VERSION" ;;
   help|-h|--help)       cmd_help ;;
   *)                    echo "ccs: unknown command '$cmd' — run \`ccs help\` for usage" >&2; exit 1 ;;

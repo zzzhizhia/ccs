@@ -111,5 +111,10 @@ case "$sh" in
 esac
 
 echo
-echo "ccs installed for $sh."
-echo "Activate now:  exec \$SHELL"
+if [[ -t 0 ]]; then
+  echo "ccs installed for $sh. Restarting shell..."
+  exec "$SHELL" -l
+else
+  echo "ccs installed for $sh."
+  echo "Activate now:  exec \$SHELL"
+fi

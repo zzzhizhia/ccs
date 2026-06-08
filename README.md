@@ -5,7 +5,13 @@ Quickly switch between Claude Code API profiles (different API keys, base URLs, 
 ## Install
 
 ```bash
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/zzzhizhia/ccs/main/install.sh | bash
+```
+
+Or clone and run locally:
+
+```bash
+git clone https://github.com/zzzhizhia/ccs.git && cd ccs && ./install.sh
 ```
 
 Done. Open a new terminal, or `exec $SHELL`.

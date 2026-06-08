@@ -105,15 +105,11 @@ echo "✓ ccs.sh → $DST"
 
 sh="$(detect_shell)"
 case "$sh" in
-  zsh)  install_hook "$HOME/.zshenv"               "$(hook_zsh)"  ;;
-  bash) install_hook "$HOME/.bashrc"                "$(hook_bash)" ;;
-  fish) install_hook "$HOME/.config/fish/config.fish" "$(hook_fish)" ;;
+  zsh)  rc="$HOME/.zshenv";               install_hook "$rc" "$(hook_zsh)"  ;;
+  bash) rc="$HOME/.bashrc";                install_hook "$rc" "$(hook_bash)" ;;
+  fish) rc="$HOME/.config/fish/config.fish"; install_hook "$rc" "$(hook_fish)" ;;
 esac
-
-# Apply to current shell
-export PATH="$HOME/.config/ccs:$PATH"
-CCS_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/ccs"
-[[ -f "$CCS_STATE/current" ]] && source "$CCS_STATE/current" 2>/dev/null || true
 
 echo
 echo "ccs installed for $sh."
+echo "Activate now:  source $rc"

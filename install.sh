@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # install.sh — install ccs for zsh / bash / fish.
+# https://github.com/zzzhizhia/ccs
 # Safe to run repeatedly (idempotent).
+# curl -fsSL https://raw.githubusercontent.com/zzzhizhia/ccs/main/install.sh | bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$SCRIPT_DIR/ccs.sh"
+REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+SRC="${SCRIPT_DIR:+$SCRIPT_DIR/ccs.sh}"
+if [[ -z "$SRC" || ! -f "$SRC" ]]; then
+  SRC="$(mktemp)"
+  curl -fsSL "$REPO/ccs.sh" -o "$SRC"
+  trap 'rm -f "$SRC"' EXIT
+fi
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 DST="$XDG_CONFIG_HOME/ccs/ccs.sh"
 

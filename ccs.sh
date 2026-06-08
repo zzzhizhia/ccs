@@ -1,5 +1,6 @@
 #!/bin/bash
 # ccs — Claude Code Switch
+# https://github.com/zzzhizhia/ccs
 # Standalone script. The thin shell wrapper in .zshenv evals stdout for
 # use/source/unset so they affect the calling shell; everything else runs
 # directly via `command ccs.sh`.

@@ -127,13 +127,7 @@ cmd_rm() {
 }
 
 cmd_update() {
-  local self="${CCS_SELF:-$XDG_CONFIG_HOME/ccs/ccs.sh}"
-  local tmp="$(mktemp)"
-  curl -fsSL "$REPO/ccs.sh" -o "$tmp" || die "failed to download update"
-  local new_version
-  new_version=$(bash "$tmp" version 2>/dev/null) || die "downloaded script is not valid"
-  mv "$tmp" "$self" && chmod +x "$self"
-  echo "✓ ccs: updated to $new_version"
+  curl -fsSL "$REPO/install.sh" | bash
 }
 
 cmd_help() {

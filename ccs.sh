@@ -127,6 +127,13 @@ cmd_rm() {
 }
 
 cmd_update() {
+  if [[ "${1:-}" == "--version" ]]; then
+    local latest
+    latest=$(curl -fsSL "$REPO/ccs.sh" | bash -s version 2>/dev/null) || die "failed to check latest version"
+    echo "current: $VERSION"
+    echo "latest:  ${latest#ccs }"
+    return
+  fi
   curl -fsSL "$REPO/install.sh" | bash
 }
 
@@ -171,7 +178,7 @@ case "$cmd" in
   unset|off)            cmd_unset ;;
   show)                 cmd_show "$@" ;;
   path)                 echo "$CCS_DIR" ;;
-  update)               cmd_update ;;
+  update)               cmd_update "$@" ;;
   version|-V|--version) echo "ccs $VERSION" ;;
   help|-h|--help)       cmd_help ;;
   *)                    echo "ccs: unknown command '$cmd' — run \`ccs help\` for usage" >&2; exit 1 ;;

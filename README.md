@@ -32,7 +32,7 @@ ccs path              Print profiles directory
 ccs version           Print version
 ```
 
-Short aliases: `ls`, `c`, `sw`, `e`, `rm`, `src`, `off`.
+Short aliases: `ls`, `c`, `sw`, `e`, `rm`, `src`, `env`, `off`.
 
 ## Profile format
 

@@ -23,7 +23,7 @@ hook_zsh() { cat <<'EOF'
 export PATH="$HOME/.config/ccs:$PATH"
 ccs() {
   case "${1:-}" in
-    use|sw|switch|source|src|unset|off)
+    use|sw|switch|source|src|env|unset|off)
       eval "$(command ccs.sh "$@")" ;;
     *) command ccs.sh "$@" ;;
   esac
@@ -39,7 +39,7 @@ hook_bash() { cat <<'EOF'
 export PATH="$HOME/.config/ccs:$PATH"
 ccs() {
   case "${1:-}" in
-    use|sw|switch|source|src|unset|off)
+    use|sw|switch|source|src|env|unset|off)
       eval "$(command ccs.sh "$@")" ;;
     *) command ccs.sh "$@" ;;
   esac
@@ -55,7 +55,7 @@ hook_fish() { cat <<'EOF'
 fish_add_path "$HOME/.config/ccs"
 function ccs
   switch "$argv[1]"
-    case use sw switch source src unset off
+    case use sw switch source src env unset off
       eval (command ccs.sh $argv)
     case '*'
       command ccs.sh $argv

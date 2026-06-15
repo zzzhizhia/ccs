@@ -2,7 +2,7 @@
 # ccs — Claude Code Switch
 # https://github.com/zzzhizhia/ccs
 # Standalone script. The thin shell wrapper in .zshenv evals stdout for
-# use/source/unset so they affect the calling shell; everything else runs
+# use/source/env/unset so they affect the calling shell; everything else runs
 # directly via `command ccs.sh`.
 
 set -euo pipefail
@@ -149,7 +149,7 @@ Usage:
   ccs list              List profiles (current one highlighted)
   ccs current           Show active profile name
   ccs use <name>        Switch to profile (current terminal + persist)
-  ccs source <name>     Source profile in current terminal only
+  ccs source <name>     Source profile in current terminal only (alias: env)
   ccs new <name>        Create a new profile (opens \$EDITOR)
   ccs edit <name>       Edit an existing profile
   ccs rm <name>         Remove a profile
@@ -175,7 +175,7 @@ case "$cmd" in
   list|ls)              cmd_list ;;
   current|c)            cmd_current ;;
   use|sw|switch)        cmd_use "$@" ;;
-  source|src)           cmd_source "$@" ;;
+  source|src|env)       cmd_source "$@" ;;
   new|create)           cmd_new "$@" ;;
   edit|e)               cmd_edit "$@" ;;
   rm|remove)            cmd_rm "$@" ;;

@@ -25,14 +25,14 @@ ccs new work          Create a profile, opens $EDITOR
 ccs edit work         Edit an existing profile
 ccs list              List all profiles (* = active)
 ccs use deepseek      Switch profile (current terminal + persist)
-ccs source minimax    Source a profile in current terminal only
+ccs env minimax       Source a profile in current terminal only
 ccs show              Show active profile (keys masked)
 ccs unset             Clear all Claude Code env vars
 ccs path              Print profiles directory
 ccs version           Print version
 ```
 
-Short aliases: `ls`, `c`, `sw`, `e`, `rm`, `src`, `env`, `off`.
+Short aliases: `ls`, `c`, `sw`, `e`, `rm`, `source`, `src`, `off`.
 
 ## Profile format
 
@@ -48,7 +48,7 @@ export ANTHROPIC_MODEL="deepseek-v4-pro[1m]"
 ## How it works
 
 `ccs.sh` is a standalone script on `PATH`. A thin shell wrapper in your rc file
-catches `use`/`source`/`unset` and `eval`s their output so the current shell picks
+catches `use`/`env`/`unset` and `eval`s their output so the current shell picks
 up the change — a child process cannot modify its parent's environment.
 
 New terminals auto-restore the last `ccs use` profile via a symlink at

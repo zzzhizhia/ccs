@@ -2,7 +2,7 @@
 # ccs — Claude Code Switch
 # https://github.com/zzzhizhia/ccs
 # Standalone script. The thin shell wrapper in .zshenv evals stdout for
-# use/source/env/unset so they affect the calling shell; everything else runs
+# use/env/source/unset so they affect the calling shell; everything else runs
 # directly via `command ccs.sh`.
 
 set -euo pipefail
@@ -40,7 +40,7 @@ cmd_use() {
 }
 
 cmd_source() {
-  local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs source <profile>"
+  local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs env <profile>"
   local profile="$CCS_DIR/$name.env"
   [[ -f "$profile" ]] || die "profile '$name' not found"
   echo "source $profile"
@@ -149,7 +149,7 @@ Usage:
   ccs list              List profiles (current one highlighted)
   ccs current           Show active profile name
   ccs use <name>        Switch to profile (current terminal + persist)
-  ccs source <name>     Source profile in current terminal only (alias: env)
+  ccs env <name>        Source profile in current terminal only (alias: source)
   ccs new <name>        Create a new profile (opens \$EDITOR)
   ccs edit <name>       Edit an existing profile
   ccs rm <name>         Remove a profile
@@ -175,7 +175,7 @@ case "$cmd" in
   list|ls)              cmd_list ;;
   current|c)            cmd_current ;;
   use|sw|switch)        cmd_use "$@" ;;
-  source|src|env)       cmd_source "$@" ;;
+  env|source|src)       cmd_source "$@" ;;
   new|create)           cmd_new "$@" ;;
   edit|e)               cmd_edit "$@" ;;
   rm|remove)            cmd_rm "$@" ;;

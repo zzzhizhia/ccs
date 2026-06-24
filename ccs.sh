@@ -27,12 +27,30 @@ CCS_VARS=(
 
 die() { echo "ccs: $*" >&2; exit 1; }
 
+# Extract export variable names from a profile file.
+_profile_vars() {
+  local file="$1"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^export[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)= ]]; then
+      echo "${BASH_REMATCH[1]}"
+    fi
+  done < "$file"
+}
+
 # ── commands that output shell code (eval'd by wrapper) ──────────────
 
 cmd_use() {
   local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs use <profile>"
   local profile="$CCS_DIR/$name.env"
   [[ -f "$profile" ]] || die "profile '$name' not found"
+
+  # Unset vars from the previous profile first to avoid stale env
+  if [[ -L "$CURRENT" ]]; then
+    local old_vars
+    old_vars="$(_profile_vars "$(readlink "$CURRENT")" | tr '\n' ' ')"
+    [[ -n "${old_vars// }" ]] && echo "unset ${old_vars% }"
+  fi
+
   ln -sf "$profile" "$CURRENT"
   echo "source $CURRENT"
   echo "✓ ccs: switched to '$name'" >&2
@@ -49,9 +67,22 @@ cmd_source() {
 }
 
 cmd_unset() {
-  echo "unset ${CCS_VARS[*]}"
-  rm -f "$CURRENT"
-  echo "✓ ccs: cleared Claude Code env" >&2
+  if [[ -L "$CURRENT" ]]; then
+    local vars
+    vars="$(_profile_vars "$(readlink "$CURRENT")" | tr '\n' ' ')"
+    if [[ -n "${vars// }" ]]; then
+      local name count
+      name="$(basename "$(readlink "$CURRENT")" .env)"
+      count="$(echo "$vars" | wc -w | tr -d ' ')"
+      echo "unset ${vars% }"
+      echo "✓ ccs: unset $count env vars from '$name'" >&2
+    else
+      echo "✓ ccs: no export vars found in profile" >&2
+    fi
+    rm -f "$CURRENT"
+  else
+    echo "✓ ccs: no active profile to unset" >&2
+  fi
 }
 
 # ── read-only / interactive commands (no eval needed) ─────────────────

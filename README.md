@@ -28,11 +28,39 @@ ccs use deepseek      Switch profile (current terminal + persist)
 ccs env minimax       Source a profile in current terminal only
 ccs show              Show active profile (keys masked)
 ccs unset             Clear all Claude Code env vars
+ccs statusline        List profiles with bound statuslines
+ccs statusline bind deepseek   Bind a statusline to a profile
+ccs statusline unbind deepseek Remove a statusline binding
+ccs statusline show deepseek   Show a profile's statusline
 ccs path              Print profiles directory
 ccs version           Print version
 ```
 
 Short aliases: `ls`, `c`, `sw`, `e`, `rm`, `source`, `src`, `off`.
+
+## Statusline
+
+Each profile can have its own **statusline** — a custom script displayed at the bottom
+of the Claude Code interface. When you switch profiles with `ccs use` or `ccs env`,
+the statusline updates automatically.
+
+```bash
+# Bind a statusline to a profile (opens $EDITOR with a template)
+ccs statusline bind deepseek
+
+# Or bind with an inline command
+ccs statusline bind openrouter --command 'printf "\\033[1;32mOR\\033[0m"'
+
+# The statusline reads Claude Code session JSON on stdin
+# Example template: shows profile name + model
+```
+
+When `ccs use <profile>` runs and the profile has a `.statusline` file, ccs:
+1. Writes the fixed statusLine config to `~/.claude/settings.json` (first time only)
+2. Copies `<profile>.statusline` → `~/.config/ccs/statusline.sh`
+
+The statusline script receives session JSON from Claude Code via stdin, including
+`model.display_name`, `workspace.current_dir`, etc.
 
 ## Profile format
 

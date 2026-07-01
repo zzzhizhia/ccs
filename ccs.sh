@@ -15,6 +15,8 @@ XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 CCS_DIR="${CCS_DIR:-$XDG_CONFIG_HOME/ccs/profiles}"
 CCS_STATE="${CCS_STATE:-$XDG_STATE_HOME/ccs}"
 CURRENT="$CCS_STATE/current"
+CCS_CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CCS_STATUSLINE_SCRIPT="$XDG_CONFIG_HOME/ccs/statusline.sh"
 
 mkdir -p "$CCS_DIR" "$CCS_STATE"
 
@@ -37,6 +39,61 @@ _profile_vars() {
   done < "$file"
 }
 
+# ── statusline helpers ────────────────────────────────────────────────
+
+# Write the fixed statusLine config into ~/.claude/settings.json.
+# Idempotent — skips if already pointing to CCS_STATUSLINE_SCRIPT.
+_ensure_statusline_setting() {
+  local settings="$CCS_CLAUDE_SETTINGS"
+  if [[ -f "$settings" ]]; then
+    local existing
+    existing=$(jq -r '.statusLine.command // ""' "$settings" 2>/dev/null) || true
+    [[ "$existing" == "$CCS_STATUSLINE_SCRIPT" ]] && return 0
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo "ccs: jq is required for statusline. Install: brew install jq" >&2
+    return 1
+  fi
+  local tmp="$settings.tmp.$$"
+  if [[ -f "$settings" ]]; then
+    jq --arg cmd "$CCS_STATUSLINE_SCRIPT" \
+      '. + {"statusLine": {"type": "command", "command": $cmd}}' \
+      "$settings" > "$tmp" && mv "$tmp" "$settings"
+  else
+    mkdir -p "$(dirname "$settings")"
+    printf '{"statusLine": {"type": "command", "command": "%s"}}\n' "$CCS_STATUSLINE_SCRIPT" > "$settings"
+  fi
+}
+
+# Apply a profile's .statusline to the runtime statusline script.
+_apply_profile_statusline() {
+  local name="$1"
+  local src="$CCS_DIR/$name.statusline"
+  local dst="$CCS_STATUSLINE_SCRIPT"
+
+  [[ -f "$src" ]] || return 0
+
+  _ensure_statusline_setting || return 1
+
+  {
+    printf '#!/bin/bash\n'
+    printf '# ccs statusline for %s\n' "$name"
+    printf '# Guard against empty HOME in non-login shells.\n'
+    printf 'HOME="${HOME:-%s}"\n' "$HOME"
+    cat "$src"
+  } > "$dst"
+  chmod +x "$dst"
+}
+
+# Clear the runtime statusline (called on unset) — only if ccs owns it.
+_clear_statusline() {
+  local dst="$CCS_STATUSLINE_SCRIPT"
+  if [[ -f "$dst" ]] && grep -qF '# ccs statusline' "$dst" 2>/dev/null; then
+    printf '#!/bin/bash\n# ccs statusline — no active profile\n' > "$dst"
+    chmod +x "$dst"
+  fi
+}
+
 # ── commands that output shell code (eval'd by wrapper) ──────────────
 
 cmd_use() {
@@ -46,15 +103,22 @@ cmd_use() {
 
   # Unset vars from the previous profile first to avoid stale env
   if [[ -L "$CURRENT" ]]; then
-    local old_vars
-    old_vars="$(_profile_vars "$(readlink "$CURRENT")" | tr '\n' ' ')"
-    [[ -n "${old_vars// }" ]] && echo "unset ${old_vars% }"
+    local old_profile
+    old_profile="$(readlink "$CURRENT")"
+    if [[ -f "$old_profile" ]]; then
+      local old_vars
+      old_vars="$(_profile_vars "$old_profile" | tr '\n' ' ')"
+      [[ -n "${old_vars// }" ]] && echo "unset ${old_vars% }"
+    else
+      rm -f "$CURRENT"
+    fi
   fi
 
   ln -sf "$profile" "$CURRENT"
   echo "source $CURRENT"
   echo "✓ ccs: switched to '$name'" >&2
   cmd_show "$name" >&2
+  _apply_profile_statusline "$name"
 }
 
 cmd_source() {
@@ -64,6 +128,13 @@ cmd_source() {
   echo "source $profile"
   echo "✓ ccs: sourced '$name' (current terminal only)" >&2
   cmd_show "$name" >&2
+  # For env: apply the profile's statusline if it has one; otherwise clear
+  # the temporary statusline so it doesn't show a stale profile.
+  if [[ -f "$CCS_DIR/$name.statusline" ]]; then
+    _apply_profile_statusline "$name"
+  else
+    _clear_statusline
+  fi
 }
 
 cmd_unset() {
@@ -83,6 +154,7 @@ cmd_unset() {
   else
     echo "✓ ccs: no active profile to unset" >&2
   fi
+  _clear_statusline
 }
 
 # ── read-only / interactive commands (no eval needed) ─────────────────
@@ -185,6 +257,10 @@ Usage:
   ccs edit <name>       Edit an existing profile
   ccs rm <name>         Remove a profile
   ccs show [<name>]     Show a profile's env file (sensitive keys masked)
+  ccs statusline        List statusline bindings
+  ccs statusline bind <name>   Bind a statusline to a profile
+  ccs statusline unbind <name> Remove a statusline binding
+  ccs statusline show <name>   Show a profile's statusline
   ccs unset             Clear all Claude Code env vars
   ccs update            Update ccs to latest version
   ccs path              Print profiles directory
@@ -195,6 +271,85 @@ Profiles: $CCS_DIR
 State:    $CURRENT
 Version:  $VERSION
 EOF
+}
+
+cmd_statusline() {
+  local sub="${1:-}"; shift 2>/dev/null || true
+
+  case "$sub" in
+    bind)
+      local name="${1:-}"; shift 2>/dev/null || true
+      [[ -z "$name" ]] && die "usage: ccs statusline bind <profile> [--command \"...\"]"
+      local profile="$CCS_DIR/$name.env"
+      [[ -f "$profile" ]] || die "profile '$name' not found — create it first: ccs new $name"
+      local sl_file="$CCS_DIR/$name.statusline"
+
+      # --command flag: write directly, skip editor
+      if [[ "${1:-}" == "--command" ]]; then
+        local cmd="${2:-}"
+        [[ -z "$cmd" ]] && die "--command requires an argument"
+        printf '%s\n' "$cmd" > "$sl_file"
+        echo "✓ ccs: statusline bound to '$name'" >&2
+        return
+      fi
+
+      # New file: write a template first
+      if [[ ! -f "$sl_file" ]]; then
+        cat > "$sl_file" <<'INNEREOF'
+# Statusline for REPLACE_ME — edit freely.
+# Claude Code sends session JSON via stdin.
+input=$(cat 2>/dev/null || true)
+model=$(echo "$input" | jq -r '.model.display_name // ""' 2>/dev/null || true)
+if [[ -n "$model" ]]; then
+  printf '\033[1;36mccs:REPLACE_ME\033[0m \033[90m[%s]\033[0m\n' "$model"
+else
+  printf '\033[1;36mccs:REPLACE_ME\033[0m\n'
+fi
+INNEREOF
+        # Replace placeholder with actual profile name
+        sed -i '' "s/REPLACE_ME/$name/g" "$sl_file"
+      fi
+      ${EDITOR:-vim} "$sl_file"
+      echo "✓ ccs: statusline bound to '$name'" >&2
+      ;;
+
+    unbind)
+      local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs statusline unbind <profile>"
+      local sl_file="$CCS_DIR/$name.statusline"
+      [[ -f "$sl_file" ]] || die "no statusline bound to '$name'"
+      rm "$sl_file"
+      echo "✓ ccs: statusline unbound from '$name'" >&2
+      ;;
+
+    show)
+      local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs statusline show <profile>"
+      local sl_file="$CCS_DIR/$name.statusline"
+      [[ -f "$sl_file" ]] || die "no statusline bound to '$name'"
+      echo "--- $name.statusline ---"
+      cat "$sl_file"
+      ;;
+
+    "")
+      shopt -s nullglob
+      local files=("$CCS_DIR"/*.statusline)
+      if ((${#files[@]} == 0)); then
+        echo "No statusline bindings in $CCS_DIR"
+        echo "Bind one with: ccs statusline bind <profile>"
+        return
+      fi
+      local max=0 fname
+      for f in "${files[@]}"; do
+        fname="$(basename "$f" .statusline)"
+        ((${#fname} > max)) && max=${#fname}
+      done
+      for f in "${files[@]}"; do
+        fname="$(basename "$f" .statusline)"
+        printf "  %-*s\n" "$max" "$fname"
+      done
+      ;;
+
+    *) die "ccs statusline: unknown subcommand '$sub' — use: bind, unbind, show" ;;
+  esac
 }
 
 # ── dispatch ─────────────────────────────────────────────────────────
@@ -215,6 +370,7 @@ case "$cmd" in
   path)                 echo "$CCS_DIR" ;;
   update)               cmd_update "$@" ;;
   version|-V|--version) echo "ccs $VERSION" ;;
+  statusline)           cmd_statusline "$@" ;;
   help|-h|--help)       cmd_help ;;
   *)                    echo "ccs: unknown command '$cmd' — run \`ccs help\` for usage" >&2; exit 1 ;;
 esac

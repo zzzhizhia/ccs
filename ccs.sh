@@ -22,9 +22,15 @@ mkdir -p "$CCS_DIR" "$CCS_STATE"
 
 # Single source of truth for all Claude Code env vars managed by ccs.
 CCS_VARS=(
-  ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL
-  ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
-  CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_EFFORT_LEVEL
+  "ANTHROPIC_BASE_URL="
+  "ANTHROPIC_AUTH_TOKEN="
+  "ANTHROPIC_MODEL="
+  "ANTHROPIC_DEFAULT_OPUS_MODEL="
+  "ANTHROPIC_DEFAULT_SONNET_MODEL="
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL="
+  "CLAUDE_CODE_SUBAGENT_MODEL="
+  "CLAUDE_CODE_EFFORT_LEVEL="
+  "CLAUDE_CODE_ATTRIBUTION_HEADER=0"
 )
 
 die() { echo "ccs: $*" >&2; exit 1; }
@@ -207,7 +213,7 @@ cmd_new() {
     echo "# Claude Code env for: $name"
     echo "# Required: ANTHROPIC_AUTH_TOKEN (and usually ANTHROPIC_BASE_URL for non-1P)"
     for v in "${CCS_VARS[@]}"; do
-      echo "export $v=\"\""
+      echo "export $v"
     done
   } > "$profile"
   echo "✓ ccs: created $profile"

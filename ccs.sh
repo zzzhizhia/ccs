@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.2.0"
 REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -17,8 +17,12 @@ CCS_STATE="${CCS_STATE:-$XDG_STATE_HOME/ccs}"
 CURRENT="$CCS_STATE/current"
 CCS_CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CCS_STATUSLINE_SCRIPT="$XDG_CONFIG_HOME/ccs/statusline.sh"
+CCS_CODEX_DIR="${CCS_CODEX_DIR:-$XDG_CONFIG_HOME/ccs/codex/profiles}"
+CCS_CODEX_STATE="${CCS_CODEX_STATE:-$XDG_STATE_HOME/ccs/codex}"
+CODEX_CURRENT="$CCS_CODEX_STATE/current"
+CODEX_CONFIG="${CODEX_HOME:-$HOME/.codex}/config.toml"
 
-mkdir -p "$CCS_DIR" "$CCS_STATE"
+mkdir -p "$CCS_DIR" "$CCS_STATE" "$CCS_CODEX_DIR" "$CCS_CODEX_STATE"
 
 # Single source of truth for all Claude Code env vars managed by ccs.
 CCS_VARS=(
@@ -235,6 +239,147 @@ cmd_rm() {
   [[ "$(cmd_current)" == "$name" ]] && rm -f "$CURRENT"
 }
 
+# ── Codex provider profiles ───────────────────────────────────────────
+
+_codex_profile_vars() { _profile_vars "$1"; }
+
+cmd_codex_use() {
+  local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs codex use <profile>"
+  local profile="$CCS_CODEX_DIR/$name.env"
+  [[ -f "$profile" ]] || die "codex profile '$name' not found"
+  if [[ -L "$CODEX_CURRENT" ]]; then
+    local old_profile old_vars
+    old_profile="$(readlink "$CODEX_CURRENT")"
+    if [[ -f "$old_profile" ]]; then
+      old_vars="$(_codex_profile_vars "$old_profile" | tr '\n' ' ')"
+      [[ -n "${old_vars// }" ]] && echo "unset ${old_vars% }"
+    else
+      rm -f "$CODEX_CURRENT"
+    fi
+  fi
+  ln -sf "$profile" "$CODEX_CURRENT"
+  echo "source $CODEX_CURRENT"
+  echo "✓ ccs: switched Codex to '$name'" >&2
+  cmd_codex_show "$name" >&2
+}
+
+cmd_codex_source() {
+  local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs codex env <profile>"
+  local profile="$CCS_CODEX_DIR/$name.env"
+  [[ -f "$profile" ]] || die "codex profile '$name' not found"
+  if [[ -L "$CODEX_CURRENT" && -f "$(readlink "$CODEX_CURRENT")" ]]; then
+    local old_vars
+    old_vars="$(_codex_profile_vars "$(readlink "$CODEX_CURRENT")" | tr '\n' ' ')"
+    [[ -n "${old_vars// }" ]] && echo "unset ${old_vars% }"
+  fi
+  echo "source $profile"
+  echo "✓ ccs: sourced Codex '$name' (current terminal only)" >&2
+  cmd_codex_show "$name" >&2
+}
+
+cmd_codex_unset() {
+  if [[ -L "$CODEX_CURRENT" ]]; then
+    local vars name count
+    vars="$(_codex_profile_vars "$(readlink "$CODEX_CURRENT")" | tr '\n' ' ')"
+    name="$(basename "$(readlink "$CODEX_CURRENT")" .env)"
+    if [[ -n "${vars// }" ]]; then
+      count="$(echo "$vars" | wc -w | tr -d ' ')"
+      echo "unset ${vars% }"
+      echo "✓ ccs: unset $count Codex env vars from '$name'" >&2
+    fi
+    rm -f "$CODEX_CURRENT"
+  else
+    echo "✓ ccs: no active Codex profile to unset" >&2
+  fi
+}
+
+cmd_codex_list() {
+  shopt -s nullglob
+  local profiles=("$CCS_CODEX_DIR"/*.env)
+  if ((${#profiles[@]} == 0)); then
+    echo "No Codex profiles in $CCS_CODEX_DIR — create one with: ccs codex new <provider>"
+    return
+  fi
+  local current="" target="" max=0 name p
+  [[ -L "$CODEX_CURRENT" ]] && target="$(readlink "$CODEX_CURRENT")" && current="$(basename "$target" .env)"
+  for p in "${profiles[@]}"; do name="$(basename "$p" .env)"; ((${#name} > max)) && max=${#name}; done
+  for p in "${profiles[@]}"; do
+    name="$(basename "$p" .env)"
+    if [[ "$name" == "$current" ]]; then printf "  %-*s  * active\n" "$max" "$name"; else printf "  %-*s\n" "$max" "$name"; fi
+  done
+}
+
+cmd_codex_current() { [[ -L "$CODEX_CURRENT" ]] && basename "$(readlink "$CODEX_CURRENT")" .env; }
+
+cmd_codex_show() {
+  local name="${1:-$(cmd_codex_current)}"
+  [[ -z "$name" ]] && die "No active Codex profile (run: ccs codex show <name>)"
+  local profile="$CCS_CODEX_DIR/$name.env"
+  [[ -f "$profile" ]] || die "codex profile '$name' not found"
+  sed -E 's@(^[[:space:]]*export[[:space:]]+[A-Za-z_][A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*=).*@\1***@I' "$profile"
+}
+
+cmd_codex_new() {
+  local provider="${1:-}"
+  [[ -z "$provider" ]] && die "usage: ccs codex new <provider>"
+  [[ "$provider" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || die "invalid Codex provider name '$provider'"
+  local profile="$CCS_CODEX_DIR/$provider.env"
+  [[ -e "$profile" ]] && die "codex profile '$provider' already exists"
+  mkdir -p "$(dirname "$CODEX_CONFIG")"
+  [[ -f "$CODEX_CONFIG" ]] || : > "$CODEX_CONFIG"
+  grep -qE "^[[:space:]]*\[model_providers\.${provider//./\.}\][[:space:]]*$" "$CODEX_CONFIG" && die "Codex provider '$provider' already exists"
+  if [[ -s "$CODEX_CONFIG" && "$(tail -c 1 "$CODEX_CONFIG" | wc -l | tr -d ' ')" == 0 ]]; then
+    printf '\n' >> "$CODEX_CONFIG"
+  fi
+  {
+    [[ -s "$CODEX_CONFIG" ]] && printf '\n'
+    printf '[model_providers.%s]\nname = "%s"\nbase_url = "https://api.example.com/v1"\nwire_api = "responses"\nenv_key = "OPENAI_API_KEY"\n' "$provider" "$provider"
+  } >> "$CODEX_CONFIG"
+  {
+    echo "# Codex provider env for: $provider"
+    echo "# Provider definition: $CODEX_CONFIG"
+    echo "export CCS_CODEX_PROVIDER=\"$provider\""
+    echo 'export OPENAI_API_KEY=""'
+  } > "$profile"
+  echo "✓ ccs: created Codex profile $profile"
+  echo "✓ ccs: added provider template to $CODEX_CONFIG"
+  ${EDITOR:-vim} "$CODEX_CONFIG"
+}
+
+cmd_codex_edit() { local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs codex edit <profile>"; local profile="$CCS_CODEX_DIR/$name.env"; [[ -f "$profile" ]] || die "codex profile '$name' not found"; ${EDITOR:-vim} "$profile"; }
+cmd_codex_rm() { local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs codex rm <profile>"; local profile="$CCS_CODEX_DIR/$name.env"; [[ -f "$profile" ]] || die "no such Codex profile '$name'"; rm -i "$profile"; [[ "$(cmd_codex_current)" == "$name" ]] && rm -f "$CODEX_CURRENT"; }
+cmd_codex_path() { echo "$CCS_CODEX_DIR"; }
+
+cmd_codex_help() {
+  cat <<EOF
+ccs codex — Codex provider switch
+
+Usage:
+  ccs codex list              List Codex profiles
+  ccs codex current           Show active Codex profile
+  ccs codex use <name>        Switch provider (current terminal + persist)
+  ccs codex env <name>        Source provider in current terminal only
+  ccs codex new <provider>    Add provider template and profile
+  ccs codex edit <name>       Edit a Codex profile
+  ccs codex rm <name>         Remove a Codex profile
+  ccs codex show [<name>]     Show profile (sensitive values masked)
+  ccs codex unset             Clear Codex profile env vars
+  ccs codex path              Print Codex profiles directory
+EOF
+}
+
+cmd_codex() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  case "$sub" in
+    list|ls) cmd_codex_list ;; current|c) cmd_codex_current ;;
+    use|sw|switch) cmd_codex_use "$@" ;; env|source|src) cmd_codex_source "$@" ;;
+    new|create) cmd_codex_new "$@" ;; edit|e) cmd_codex_edit "$@" ;;
+    rm|remove) cmd_codex_rm "$@" ;; unset|off) cmd_codex_unset ;;
+    show) cmd_codex_show "$@" ;; path) cmd_codex_path ;;
+    help|-h|--help) cmd_codex_help ;; *) die "ccs codex: unknown command '$sub'" ;;
+  esac
+}
+
 cmd_update() {
   if [[ "${1:-}" == "--version" ]]; then
     local remote_sha local_sha
@@ -271,10 +416,13 @@ Usage:
   ccs update            Update ccs to latest version
   ccs path              Print profiles directory
   ccs version           Print version
+  ccs codex ...         Manage Codex provider profiles (run 'ccs codex help')
   ccs help              This message
 
 Profiles: $CCS_DIR
 State:    $CURRENT
+Codex profiles: $CCS_CODEX_DIR
+Codex state:    $CODEX_CURRENT
 Version:  $VERSION
 EOF
 }
@@ -377,6 +525,7 @@ case "$cmd" in
   update)               cmd_update "$@" ;;
   version|-V|--version) echo "ccs $VERSION" ;;
   statusline)           cmd_statusline "$@" ;;
+  codex)                cmd_codex "$@" ;;
   help|-h|--help)       cmd_help ;;
   *)                    echo "ccs: unknown command '$cmd' — run \`ccs help\` for usage" >&2; exit 1 ;;
 esac

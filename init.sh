@@ -5,8 +5,29 @@ ccs() {
   case "${1:-}" in
     use|sw|switch|env|source|src|unset|off)
       eval "$(command ccs.sh "$@")" ;;
+    codex)
+      case "${2:-}" in
+        use|sw|switch|env|source|src|unset|off) eval "$(command ccs.sh "$@")" ;;
+        *) command ccs.sh "$@" ;;
+      esac ;;
     *) command ccs.sh "$@" ;;
   esac
+}
+codex() {
+  local provider="${CCS_CODEX_PROVIDER:-}" arg next explicit=0
+  for arg in "$@"; do
+    [[ "${next:-0}" == 1 ]] && { [[ "$arg" == model_provider=* ]] && explicit=1; next=0; continue; }
+    case "$arg" in
+      -p|--profile|--profile=*) explicit=1; next=1 ;;
+      -c|--config) next=1 ;;
+      --config=model_provider=*|model_provider=*|model_provider\ =*) explicit=1 ;;
+    esac
+  done
+  if [[ -n "$provider" && "$explicit" == 0 ]]; then
+    command codex -c "model_provider=\"$provider\"" "$@"
+  else
+    command codex "$@"
+  fi
 }
 CCS_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/ccs"
 if [ -f "$CCS_STATE/current" ]; then
@@ -21,5 +42,9 @@ if [ -f "$CCS_STATE/current" ]; then
       chmod +x "$sl_dst"
     fi
   fi
+fi
+CCS_CODEX_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/ccs/codex"
+if [ -L "$CCS_CODEX_STATE/current" ]; then
+  source "$CCS_CODEX_STATE/current"
 fi
 # <<< ccs <<<

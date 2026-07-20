@@ -34,6 +34,11 @@ ccs statusline unbind deepseek Remove a statusline binding
 ccs statusline show deepseek   Show a profile's statusline
 ccs path              Print profiles directory
 ccs version           Print version
+ccs codex new proxy   Add a Codex provider template and profile
+ccs codex use proxy   Switch Codex provider (current terminal + persist)
+ccs codex env proxy   Source Codex provider in current terminal only
+ccs codex list        List Codex provider profiles
+ccs codex unset       Clear the active Codex provider profile
 ```
 
 Short aliases: `ls`, `c`, `sw`, `e`, `rm`, `source`, `src`, `off`.
@@ -88,3 +93,12 @@ New terminals auto-restore the last `ccs use` profile via a symlink at
 |----------|---------|---------|
 | `XDG_CONFIG_HOME` | `~/.config` | Profiles live under `$XDG_CONFIG_HOME/ccs/` |
 | `XDG_STATE_HOME` | `~/.local/state` | Active profile symlink at `$XDG_STATE_HOME/ccs/current` |
+
+## Codex providers
+
+Codex providers are managed separately from Claude Code profiles. `ccs codex new
+<provider>` appends a provider template to `${CODEX_HOME:-~/.codex}/config.toml`,
+creates a ccs environment profile, and opens the config file in `$EDITOR`.
+After `ccs codex use <provider>`, the shell wrapper automatically passes the
+selected provider to `codex` with `-c model_provider=...`. Provider API keys are
+kept in the profile and use the variable named by the provider's `env_key`.

@@ -34,11 +34,13 @@ ccs statusline unbind deepseek Remove a statusline binding
 ccs statusline show deepseek   Show a profile's statusline
 ccs path              Print profiles directory
 ccs version           Print version
-ccs codex new proxy   Add a Codex provider template and profile
-ccs codex use proxy   Switch Codex provider (current terminal + persist)
-ccs codex env proxy   Source Codex provider in current terminal only
-ccs codex list        List Codex provider profiles
-ccs codex unset       Clear the active Codex provider profile
+ccs codex new proxy   Create a provider and enter its API key
+ccs codex new openai  Create an official ChatGPT subscription login
+ccs codex login       Sign in to OpenAI again and refresh its snapshot
+ccs codex use proxy   Switch config.toml and auth.json
+ccs codex edit proxy  Update provider settings or rotate its API key
+ccs codex list        List providers and saved credentials
+ccs codex show proxy  Show provider metadata with secrets masked
 ```
 
 Short aliases: `ls`, `c`, `sw`, `e`, `rm`, `source`, `src`, `off`.
@@ -96,9 +98,43 @@ New terminals auto-restore the last `ccs use` profile via a symlink at
 
 ## Codex providers
 
-Codex providers are managed separately from Claude Code profiles. `ccs codex new
-<provider>` appends a provider template to `${CODEX_HOME:-~/.codex}/config.toml`,
-creates a ccs environment profile, and opens the config file in `$EDITOR`.
-After `ccs codex use <provider>`, the shell wrapper automatically passes the
-selected provider to `codex` with `-c model_provider=...`. Provider API keys are
-kept in the profile and use the variable named by the provider's `env_key`.
+Codex provider switching does not use shell environment variables. `ccs codex
+new <provider>` interactively asks for the provider name, base URL, wire API,
+and API key. It writes the provider definition to `~/.codex/config.toml` and
+stores a protected auth snapshot in `~/.codex/ccs-auth/`.
+
+`ccs codex use <provider>` first saves the current `~/.codex/auth.json`, then
+restores the target provider's auth and updates the top-level `model_provider`
+in `config.toml`. This also preserves the built-in `openai` provider's complete
+ChatGPT login, including refresh tokens.
+
+For a new machine, create the official subscription credential through Codex's
+native browser login. CCS never handles the password or OAuth exchange itself;
+after Codex finishes, CCS validates `auth.json` and stores the complete login:
+
+```bash
+ccs codex new openai
+```
+
+Use `ccs codex login` later to sign in again or refresh the managed OpenAI
+credential.
+
+```bash
+ccs codex new proxy
+ccs codex use proxy
+ccs codex current
+ccs codex show proxy
+ccs codex use openai
+```
+
+On the first v0.3 command, old Codex `.env` profiles are migrated automatically.
+The old profile directory is retained as a timestamped read-only backup. Restart
+the shell after upgrading so a v0.2 `codex()` wrapper is no longer loaded.
+
+Codex files:
+
+| Path | Purpose |
+|------|---------|
+| `~/.codex/config.toml` | Provider definitions and active `model_provider` |
+| `~/.codex/auth.json` | Credentials currently used by Codex |
+| `~/.codex/ccs-auth/<provider>.json` | Protected per-provider auth snapshots |

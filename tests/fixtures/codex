@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "login" ]]; then
+  mkdir -p "$HOME/.codex"
+  jq -n '{auth_mode:"chatgpt",OPENAI_API_KEY:null,tokens:{access_token:"native-access",id_token:"native-id",refresh_token:"native-refresh",account_id:"native-account"}}' \
+    > "$HOME/.codex/auth.json"
+  chmod 600 "$HOME/.codex/auth.json"
+  echo "Successfully logged in"
+  exit 0
+fi
+
+echo "fake codex: unsupported command" >&2
+exit 2

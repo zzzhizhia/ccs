@@ -1,13 +1,13 @@
 #!/bin/bash
 # ccs — Claude Code Switch
 # https://github.com/zzzhizhia/ccs
-# Standalone script. The thin shell wrapper in .zshenv evals stdout for
-# use/env/source/unset so they affect the calling shell; everything else runs
-# directly via `command ccs.sh`.
+# Standalone script. The thin shell wrapper evals stdout only for Claude
+# use/env/source/unset so those commands affect the calling shell. Codex
+# provider commands update ~/.codex files directly and never need eval.
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -17,12 +17,14 @@ CCS_STATE="${CCS_STATE:-$XDG_STATE_HOME/ccs}"
 CURRENT="$CCS_STATE/current"
 CCS_CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CCS_STATUSLINE_SCRIPT="$XDG_CONFIG_HOME/ccs/statusline.sh"
-CCS_CODEX_DIR="${CCS_CODEX_DIR:-$XDG_CONFIG_HOME/ccs/codex/profiles}"
-CCS_CODEX_STATE="${CCS_CODEX_STATE:-$XDG_STATE_HOME/ccs/codex}"
-CODEX_CURRENT="$CCS_CODEX_STATE/current"
-CODEX_CONFIG="${CODEX_HOME:-$HOME/.codex}/config.toml"
+CODEX_DIR="$HOME/.codex"
+CODEX_CONFIG="$CODEX_DIR/config.toml"
+CODEX_AUTH="$CODEX_DIR/auth.json"
+CODEX_AUTH_DIR="$CODEX_DIR/ccs-auth"
+CODEX_LOCK="$CODEX_DIR/.ccs.lock"
+CODEX_MIGRATION_MARKER="$CODEX_AUTH_DIR/.migrated-v1"
 
-mkdir -p "$CCS_DIR" "$CCS_STATE" "$CCS_CODEX_DIR" "$CCS_CODEX_STATE"
+mkdir -p "$CCS_DIR" "$CCS_STATE"
 
 # Single source of truth for all Claude Code env vars managed by ccs.
 CCS_VARS=(
@@ -239,132 +241,487 @@ cmd_rm() {
   [[ "$(cmd_current)" == "$name" ]] && rm -f "$CURRENT"
 }
 
-# ── Codex provider profiles ───────────────────────────────────────────
+# ── Codex provider files ──────────────────────────────────────────────
 
-_codex_profile_vars() { _profile_vars "$1"; }
+_codex_require_jq() { command -v jq &>/dev/null || die "jq is required for ccs codex (install: brew install jq)"; }
 
-cmd_codex_use() {
-  local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs codex use <profile>"
-  local profile="$CCS_CODEX_DIR/$name.env"
-  [[ -f "$profile" ]] || die "codex profile '$name' not found"
-  if [[ -L "$CODEX_CURRENT" ]]; then
-    local old_profile old_vars
-    old_profile="$(readlink "$CODEX_CURRENT")"
-    if [[ -f "$old_profile" ]]; then
-      old_vars="$(_codex_profile_vars "$old_profile" | tr '\n' ' ')"
-      [[ -n "${old_vars// }" ]] && echo "unset ${old_vars% }"
-    else
-      rm -f "$CODEX_CURRENT"
-    fi
-  fi
-  ln -sf "$profile" "$CODEX_CURRENT"
-  echo "source $CODEX_CURRENT"
-  echo "✓ ccs: switched Codex to '$name'" >&2
-  cmd_codex_show "$name" >&2
+_codex_init_dirs() {
+  mkdir -p "$CODEX_DIR" "$CODEX_AUTH_DIR"
+  chmod 700 "$CODEX_AUTH_DIR"
+  [[ -f "$CODEX_CONFIG" ]] || : > "$CODEX_CONFIG"
 }
 
-cmd_codex_source() {
-  local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs codex env <profile>"
-  local profile="$CCS_CODEX_DIR/$name.env"
-  [[ -f "$profile" ]] || die "codex profile '$name' not found"
-  if [[ -L "$CODEX_CURRENT" && -f "$(readlink "$CODEX_CURRENT")" ]]; then
-    local old_vars
-    old_vars="$(_codex_profile_vars "$(readlink "$CODEX_CURRENT")" | tr '\n' ' ')"
-    [[ -n "${old_vars// }" ]] && echo "unset ${old_vars% }"
+_codex_lock_acquire() {
+  _codex_init_dirs
+  if ! mkdir "$CODEX_LOCK" 2>/dev/null; then
+    die "another ccs codex operation is running (lock: $CODEX_LOCK)"
   fi
-  echo "source $profile"
-  echo "✓ ccs: sourced Codex '$name' (current terminal only)" >&2
-  cmd_codex_show "$name" >&2
+  trap '_codex_lock_release' EXIT HUP INT TERM
 }
 
-cmd_codex_unset() {
-  if [[ -L "$CODEX_CURRENT" ]]; then
-    local vars name count
-    vars="$(_codex_profile_vars "$(readlink "$CODEX_CURRENT")" | tr '\n' ' ')"
-    name="$(basename "$(readlink "$CODEX_CURRENT")" .env)"
-    if [[ -n "${vars// }" ]]; then
-      count="$(echo "$vars" | wc -w | tr -d ' ')"
-      echo "unset ${vars% }"
-      echo "✓ ccs: unset $count Codex env vars from '$name'" >&2
-    fi
-    rm -f "$CODEX_CURRENT"
+_codex_lock_release() {
+  rmdir "$CODEX_LOCK" 2>/dev/null || true
+  trap - EXIT HUP INT TERM
+}
+
+_codex_validate_auth() {
+  local file="$1"
+  [[ -f "$file" ]] || die "Codex auth file not found: $file"
+  jq -e 'type == "object" and (.auth_mode | type == "string")' "$file" >/dev/null 2>&1 \
+    || die "invalid Codex auth JSON: $file"
+}
+
+_codex_atomic_copy() {
+  local src="$1" dst="$2" tmp
+  tmp="$(dirname "$dst")/.ccs.$(basename "$dst").tmp.$$"
+  cp "$src" "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$dst"
+}
+
+_codex_current_raw() {
+  local current
+  current="$(sed -nE 's/^model_provider[[:space:]]*=[[:space:]]*"([A-Za-z_][A-Za-z0-9_-]*)"[[:space:]]*$/\1/p' "$CODEX_CONFIG" | head -n 1)"
+  printf '%s\n' "${current:-openai}"
+}
+
+_codex_provider_exists() {
+  local name="$1"
+  [[ "$name" == "openai" ]] && return 0
+  grep -qE "^[[:space:]]*\[model_providers\.${name}\][[:space:]]*$" "$CODEX_CONFIG"
+}
+
+_codex_provider_names() {
+  {
+    echo openai
+    sed -nE 's/^[[:space:]]*\[model_providers\.([A-Za-z_][A-Za-z0-9_-]*)\][[:space:]]*$/\1/p' "$CODEX_CONFIG"
+  } | awk '!seen[$0]++'
+}
+
+_codex_provider_field() {
+  local provider="$1" field="$2"
+  [[ "$provider" == "openai" ]] && { [[ "$field" == "name" ]] && echo OpenAI; return; }
+  awk -v section="model_providers.$provider" -v key="$field" '
+    { header=$0; gsub(/[[:space:]]/, "", header) }
+    header == "[" section "]" { inside=1; next }
+    inside && /^\[/ { exit }
+    inside && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      line=$0; sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*\\\"", "", line)
+      sub("\\\"[[:space:]]*$", "", line); print line; exit
+    }
+  ' "$CODEX_CONFIG"
+}
+
+_codex_toml_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "$value"
+}
+
+_codex_config_with_current() {
+  local provider="$1" output="$2"
+  awk -v provider="$provider" '
+    BEGIN { replaced=0 }
+    /^model_provider[[:space:]]*=/ && !replaced { print "model_provider = \"" provider "\""; replaced=1; next }
+    { lines[++n]=$0 }
+    END {
+      if (!replaced) print "model_provider = \"" provider "\""
+      for (i=1; i<=n; i++) print lines[i]
+    }
+  ' "$CODEX_CONFIG" > "$output"
+}
+
+_codex_config_without_provider() {
+  local provider="$1" output="$2"
+  awk -v section="model_providers.$provider" '
+    { header=$0; gsub(/[[:space:]]/, "", header) }
+    header == "[" section "]" { skip=1; next }
+    skip && /^\[/ { skip=0 }
+    !skip { print }
+  ' "$CODEX_CONFIG" > "$output"
+}
+
+_codex_config_update_provider() {
+  local provider="$1" display="$2" base_url="$3" wire_api="$4" output="$5"
+  display="$(_codex_toml_escape "$display")"
+  base_url="$(_codex_toml_escape "$base_url")"
+  awk -v section="model_providers.$provider" -v display="$display" -v base_url="$base_url" -v wire_api="$wire_api" '
+    function missing_fields() {
+      if (!seen_name) print "name = \"" display "\""
+      if (!seen_base) print "base_url = \"" base_url "\""
+      if (!seen_wire) print "wire_api = \"" wire_api "\""
+      if (!seen_auth) print "requires_openai_auth = true"
+    }
+    { header=$0; gsub(/[[:space:]]/, "", header) }
+    header == "[" section "]" { inside=1; print; next }
+    inside && /^\[/ { missing_fields(); inside=0 }
+    inside && /^[[:space:]]*name[[:space:]]*=/ { print "name = \"" display "\""; seen_name=1; next }
+    inside && /^[[:space:]]*base_url[[:space:]]*=/ { print "base_url = \"" base_url "\""; seen_base=1; next }
+    inside && /^[[:space:]]*wire_api[[:space:]]*=/ { print "wire_api = \"" wire_api "\""; seen_wire=1; next }
+    inside && /^[[:space:]]*requires_openai_auth[[:space:]]*=/ { print "requires_openai_auth = true"; seen_auth=1; next }
+    inside && /^[[:space:]]*env_key[[:space:]]*=/ { next }
+    { print }
+    END { if (inside) missing_fields() }
+  ' "$CODEX_CONFIG" > "$output"
+}
+
+_codex_append_provider() {
+  local file="$1" provider="$2" display="$3" base_url="$4" wire_api="$5"
+  [[ ! -s "$file" || "$(tail -c 1 "$file" | wc -l | tr -d ' ')" != 0 ]] || printf '\n' >> "$file"
+  [[ ! -s "$file" ]] || printf '\n' >> "$file"
+  printf '[model_providers.%s]\nname = "%s"\nbase_url = "%s"\nwire_api = "%s"\nrequires_openai_auth = true\n' \
+    "$provider" "$(_codex_toml_escape "$display")" "$(_codex_toml_escape "$base_url")" "$wire_api" >> "$file"
+}
+
+_codex_write_api_auth() {
+  local key="$1" output="$2"
+  jq -n --arg key "$key" '{auth_mode:"apikey",OPENAI_API_KEY:$key}' > "$output"
+  chmod 600 "$output"
+}
+
+_codex_read_legacy_value() {
+  local file="$1" variable="$2" value
+  value="$(sed -nE "s/^export[[:space:]]+${variable}=(.*)$/\\1/p" "$file" | tail -n 1)"
+  if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+  if [[ "$value" == \'*\' && "$value" == *\' ]]; then value="${value:1:${#value}-2}"; fi
+  printf '%s' "$value"
+}
+
+_codex_migrate_locked() {
+  [[ -f "$CODEX_MIGRATION_MARKER" ]] && return 0
+  _codex_require_jq
+
+  if [[ -f "$CODEX_AUTH" ]]; then
+    _codex_validate_auth "$CODEX_AUTH"
+    [[ -f "$CODEX_AUTH_DIR/openai.json" ]] || _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/openai.json"
+  fi
+
+  local legacy_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ccs/codex/profiles"
+  local legacy_state="${XDG_STATE_HOME:-$HOME/.local/state}/ccs/codex/current"
+  local active="" file provider key tmp stamp backup
+  shopt -s nullglob
+  if [[ -d "$legacy_dir" ]]; then
+    for file in "$legacy_dir"/*.env; do
+      provider="$(_codex_read_legacy_value "$file" CCS_CODEX_PROVIDER)"
+      key="$(_codex_read_legacy_value "$file" OPENAI_API_KEY)"
+      [[ -n "$provider" && "$provider" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ && -n "$key" ]] || continue
+      tmp="$CODEX_AUTH_DIR/.ccs.$provider.json.tmp.$$"
+      _codex_write_api_auth "$key" "$tmp"
+      mv "$tmp" "$CODEX_AUTH_DIR/$provider.json"
+      if _codex_provider_exists "$provider"; then
+        local display base_url wire_api config_tmp
+        display="$(_codex_provider_field "$provider" name)"
+        base_url="$(_codex_provider_field "$provider" base_url)"
+        wire_api="$(_codex_provider_field "$provider" wire_api)"
+        config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
+        _codex_config_update_provider "$provider" "${display:-$provider}" "$base_url" "${wire_api:-responses}" "$config_tmp"
+        mv "$config_tmp" "$CODEX_CONFIG"
+      fi
+    done
+  fi
+
+  if [[ -L "$legacy_state" ]]; then
+    active="$(basename "$(readlink "$legacy_state")" .env)"
+  fi
+  if [[ -n "$active" && -f "$CODEX_AUTH_DIR/$active.json" ]] && _codex_provider_exists "$active"; then
+    _codex_atomic_copy "$CODEX_AUTH_DIR/$active.json" "$CODEX_AUTH"
+    tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
+    _codex_config_with_current "$active" "$tmp"
+    mv "$tmp" "$CODEX_CONFIG"
+  fi
+
+  stamp="$(date +%Y%m%d%H%M%S)"
+  if [[ -d "$legacy_dir" ]]; then
+    backup="$(dirname "$legacy_dir")/profiles.migrated-$stamp"
+    mv "$legacy_dir" "$backup"
+    chmod -R go-rwx,a-w "$backup"
+    echo "✓ ccs: migrated legacy Codex profiles to $CODEX_AUTH_DIR" >&2
+    echo "  read-only backup: $backup" >&2
+  fi
+  if [[ -L "$legacy_state" ]]; then
+    mv "$legacy_state" "$(dirname "$legacy_state")/current.migrated-$stamp"
+  fi
+  : > "$CODEX_MIGRATION_MARKER"
+  chmod 600 "$CODEX_MIGRATION_MARKER"
+}
+
+_codex_prepare() {
+  _codex_require_jq
+  _codex_init_dirs
+  if [[ ! -f "$CODEX_MIGRATION_MARKER" ]]; then
+    _codex_lock_acquire
+    _codex_migrate_locked
+    _codex_lock_release
+  fi
+}
+
+_codex_read_secret() {
+  local prompt="$1" value
+  if [[ -t 0 ]]; then
+    read -r -s -p "$prompt" value
+    echo >&2
   else
-    echo "✓ ccs: no active Codex profile to unset" >&2
+    IFS= read -r value
   fi
+  printf '%s' "$value"
 }
+
+_codex_native_login() {
+  local binary current auth_backup="" snapshot_backup="" config_tmp
+  binary="$(type -P codex 2>/dev/null || true)"
+  [[ -n "$binary" ]] || die "Codex CLI not found; install it before creating an OpenAI subscription login"
+
+  _codex_lock_acquire
+  current="$(_codex_current_raw)"
+  if [[ -f "$CODEX_AUTH" ]]; then
+    _codex_validate_auth "$CODEX_AUTH"
+    _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/$current.json"
+    auth_backup="$CODEX_DIR/.ccs.auth.json.login-backup.$$"
+    cp "$CODEX_AUTH" "$auth_backup"
+    chmod 600 "$auth_backup"
+  fi
+  if [[ -f "$CODEX_AUTH_DIR/openai.json" ]]; then
+    snapshot_backup="$CODEX_AUTH_DIR/.ccs.openai.json.login-backup.$$"
+    cp "$CODEX_AUTH_DIR/openai.json" "$snapshot_backup"
+    chmod 600 "$snapshot_backup"
+  fi
+
+  echo "ccs: starting the official Codex ChatGPT login..." >&2
+  if ! "$binary" login -c 'model_provider="openai"'; then
+    if [[ -n "$auth_backup" ]]; then mv "$auth_backup" "$CODEX_AUTH"; else rm -f "$CODEX_AUTH"; fi
+    [[ -z "$snapshot_backup" ]] || mv "$snapshot_backup" "$CODEX_AUTH_DIR/openai.json"
+    die "official Codex login did not complete"
+  fi
+  if ! jq -e '.auth_mode == "chatgpt" and (.tokens | type == "object")' "$CODEX_AUTH" >/dev/null 2>&1; then
+    if [[ -n "$auth_backup" ]]; then mv "$auth_backup" "$CODEX_AUTH"; else rm -f "$CODEX_AUTH"; fi
+    [[ -z "$snapshot_backup" ]] || mv "$snapshot_backup" "$CODEX_AUTH_DIR/openai.json"
+    die "Codex login did not create a ChatGPT subscription credential; previous auth was restored"
+  fi
+
+  _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/openai.json"
+  config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
+  _codex_config_with_current openai "$config_tmp"
+  if ! mv "$config_tmp" "$CODEX_CONFIG"; then
+    if [[ -n "$auth_backup" ]]; then mv "$auth_backup" "$CODEX_AUTH"; else rm -f "$CODEX_AUTH"; fi
+    if [[ -n "$snapshot_backup" ]]; then mv "$snapshot_backup" "$CODEX_AUTH_DIR/openai.json"; else rm -f "$CODEX_AUTH_DIR/openai.json"; fi
+    die "failed to update $CODEX_CONFIG; previous auth was restored"
+  fi
+  [[ -z "$auth_backup" || ! -f "$auth_backup" ]] || rm -f "$auth_backup"
+  [[ -z "$snapshot_backup" || ! -f "$snapshot_backup" ]] || rm -f "$snapshot_backup"
+  _codex_lock_release
+  echo "✓ ccs: OpenAI subscription login is active and managed"
+}
+
+cmd_codex_current() { _codex_prepare; _codex_current_raw; }
 
 cmd_codex_list() {
-  shopt -s nullglob
-  local profiles=("$CCS_CODEX_DIR"/*.env)
-  if ((${#profiles[@]} == 0)); then
-    echo "No Codex profiles in $CCS_CODEX_DIR — create one with: ccs codex new <provider>"
-    return
-  fi
-  local current="" target="" max=0 name p
-  [[ -L "$CODEX_CURRENT" ]] && target="$(readlink "$CODEX_CURRENT")" && current="$(basename "$target" .env)"
-  for p in "${profiles[@]}"; do name="$(basename "$p" .env)"; ((${#name} > max)) && max=${#name}; done
-  for p in "${profiles[@]}"; do
-    name="$(basename "$p" .env)"
-    if [[ "$name" == "$current" ]]; then printf "  %-*s  * active\n" "$max" "$name"; else printf "  %-*s\n" "$max" "$name"; fi
+  _codex_prepare
+  local current name max=0
+  local names=()
+  current="$(_codex_current_raw)"
+  while IFS= read -r name; do names+=("$name"); ((${#name} > max)) && max=${#name}; done < <(_codex_provider_names)
+  for name in "${names[@]}"; do
+    printf '  %-*s  %s%s\n' "$max" "$name" \
+      "$([[ "$name" == "$current" ]] && echo '* active' || echo '        ')" \
+      "$([[ -f "$CODEX_AUTH_DIR/$name.json" ]] && echo '  auth: saved' || echo '  auth: missing')"
   done
 }
 
-cmd_codex_current() { [[ -L "$CODEX_CURRENT" ]] && basename "$(readlink "$CODEX_CURRENT")" .env; }
-
 cmd_codex_show() {
-  local name="${1:-$(cmd_codex_current)}"
-  [[ -z "$name" ]] && die "No active Codex profile (run: ccs codex show <name>)"
-  local profile="$CCS_CODEX_DIR/$name.env"
-  [[ -f "$profile" ]] || die "codex profile '$name' not found"
-  sed -E 's@(^[[:space:]]*export[[:space:]]+[A-Za-z_][A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*=).*@\1***@I' "$profile"
+  _codex_prepare
+  local name="${1:-}" snapshot
+  name="${name:-$(_codex_current_raw)}"
+  snapshot="$CODEX_AUTH_DIR/$name.json"
+  _codex_provider_exists "$name" || die "Codex provider '$name' not found"
+  echo "provider: $name"
+  [[ "$name" == "$(_codex_current_raw)" ]] && echo "active:   yes" || echo "active:   no"
+  if [[ "$name" != "openai" ]]; then
+    echo "name:     $(_codex_provider_field "$name" name)"
+    echo "base_url: $(_codex_provider_field "$name" base_url)"
+    echo "wire_api: $(_codex_provider_field "$name" wire_api)"
+  fi
+  if [[ -f "$snapshot" ]]; then
+    _codex_validate_auth "$snapshot"
+    echo "auth:     $(jq -r '.auth_mode' "$snapshot")"
+    [[ "$(jq -r 'has("OPENAI_API_KEY") and (.OPENAI_API_KEY != null and .OPENAI_API_KEY != "")' "$snapshot")" == true ]] && echo "api_key:  ***"
+    [[ "$(jq -r 'has("tokens") and (.tokens != null)' "$snapshot")" == true ]] && echo "tokens:   saved"
+  else
+    echo "auth:     missing"
+  fi
+  return 0
 }
 
 cmd_codex_new() {
-  local provider="${1:-}"
-  [[ -z "$provider" ]] && die "usage: ccs codex new <provider>"
-  [[ "$provider" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || die "invalid Codex provider name '$provider'"
-  local profile="$CCS_CODEX_DIR/$provider.env"
-  [[ -e "$profile" ]] && die "codex profile '$provider' already exists"
-  mkdir -p "$(dirname "$CODEX_CONFIG")"
-  [[ -f "$CODEX_CONFIG" ]] || : > "$CODEX_CONFIG"
-  grep -qE "^[[:space:]]*\[model_providers\.${provider//./\.}\][[:space:]]*$" "$CODEX_CONFIG" && die "Codex provider '$provider' already exists"
-  if [[ -s "$CODEX_CONFIG" && "$(tail -c 1 "$CODEX_CONFIG" | wc -l | tr -d ' ')" == 0 ]]; then
-    printf '\n' >> "$CODEX_CONFIG"
+  _codex_prepare
+  local provider="${1:-}" display base_url wire_api key config_tmp auth_tmp
+  [[ -n "$provider" ]] || die "usage: ccs codex new <provider>"
+  if [[ "$provider" == "openai" ]]; then
+    [[ ! -f "$CODEX_AUTH_DIR/openai.json" ]] || die "OpenAI auth is already managed; run 'ccs codex login' to sign in again"
+    _codex_native_login
+    return 0
   fi
-  {
-    [[ -s "$CODEX_CONFIG" ]] && printf '\n'
-    printf '[model_providers.%s]\nname = "%s"\nbase_url = "https://api.example.com/v1"\nwire_api = "responses"\nenv_key = "OPENAI_API_KEY"\n' "$provider" "$provider"
-  } >> "$CODEX_CONFIG"
-  {
-    echo "# Codex provider env for: $provider"
-    echo "# Provider definition: $CODEX_CONFIG"
-    echo "export CCS_CODEX_PROVIDER=\"$provider\""
-    echo 'export OPENAI_API_KEY=""'
-  } > "$profile"
-  echo "✓ ccs: created Codex profile $profile"
-  echo "✓ ccs: added provider template to $CODEX_CONFIG"
-  ${EDITOR:-vim} "$CODEX_CONFIG"
+  [[ "$provider" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ && "$provider" != "openai" ]] || die "invalid Codex provider name '$provider'"
+  _codex_provider_exists "$provider" && die "Codex provider '$provider' already exists"
+
+  read -r -p "Display name [$provider]: " display
+  display="${display:-$provider}"
+  read -r -p "Base URL: " base_url
+  [[ -n "$base_url" ]] || die "Base URL is required"
+  read -r -p "Wire API [responses]: " wire_api
+  wire_api="${wire_api:-responses}"
+  [[ "$wire_api" == "responses" || "$wire_api" == "chat" ]] || die "wire API must be 'responses' or 'chat'"
+  key="$(_codex_read_secret 'API key: ')"
+  [[ -n "$key" ]] || die "API key is required"
+
+  _codex_lock_acquire
+  _codex_provider_exists "$provider" && die "Codex provider '$provider' already exists"
+  [[ ! -e "$CODEX_AUTH_DIR/$provider.json" ]] || die "Codex auth snapshot '$provider' already exists"
+  config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
+  auth_tmp="$CODEX_AUTH_DIR/.ccs.$provider.json.tmp.$$"
+  cp "$CODEX_CONFIG" "$config_tmp"
+  _codex_append_provider "$config_tmp" "$provider" "$display" "$base_url" "$wire_api"
+  _codex_write_api_auth "$key" "$auth_tmp"
+  mv "$auth_tmp" "$CODEX_AUTH_DIR/$provider.json"
+  if ! mv "$config_tmp" "$CODEX_CONFIG"; then
+    rm -f "$CODEX_AUTH_DIR/$provider.json"
+    die "failed to update $CODEX_CONFIG; provider auth was removed"
+  fi
+  chmod 600 "$CODEX_AUTH_DIR/$provider.json"
+  _codex_lock_release
+  echo "✓ ccs: created Codex provider '$provider'"
+  echo "  switch with: ccs codex use $provider"
 }
 
-cmd_codex_edit() { local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs codex edit <profile>"; local profile="$CCS_CODEX_DIR/$name.env"; [[ -f "$profile" ]] || die "codex profile '$name' not found"; ${EDITOR:-vim} "$profile"; }
-cmd_codex_rm() { local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs codex rm <profile>"; local profile="$CCS_CODEX_DIR/$name.env"; [[ -f "$profile" ]] || die "no such Codex profile '$name'"; rm -i "$profile"; [[ "$(cmd_codex_current)" == "$name" ]] && rm -f "$CODEX_CURRENT"; }
-cmd_codex_path() { echo "$CCS_CODEX_DIR"; }
+cmd_codex_use() {
+  _codex_prepare
+  local target="${1:-}" current config_tmp auth_tmp auth_backup=""
+  [[ -n "$target" ]] || die "usage: ccs codex use <provider>"
+  _codex_provider_exists "$target" || die "Codex provider '$target' not found"
+  _codex_validate_auth "$CODEX_AUTH_DIR/$target.json"
+
+  _codex_lock_acquire
+  _codex_provider_exists "$target" || die "Codex provider '$target' not found"
+  _codex_validate_auth "$CODEX_AUTH_DIR/$target.json"
+  current="$(_codex_current_raw)"
+  if [[ -f "$CODEX_AUTH" ]]; then
+    _codex_validate_auth "$CODEX_AUTH"
+    _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/$current.json"
+    auth_backup="$CODEX_DIR/.ccs.auth.json.backup.$$"
+    cp "$CODEX_AUTH" "$auth_backup"
+  fi
+  config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
+  auth_tmp="$CODEX_DIR/.ccs.auth.json.tmp.$$"
+  _codex_config_with_current "$target" "$config_tmp"
+  cp "$CODEX_AUTH_DIR/$target.json" "$auth_tmp"
+  chmod 600 "$auth_tmp"
+  mv "$auth_tmp" "$CODEX_AUTH"
+  if ! mv "$config_tmp" "$CODEX_CONFIG"; then
+    [[ -n "$auth_backup" ]] && mv "$auth_backup" "$CODEX_AUTH"
+    die "failed to update $CODEX_CONFIG; auth was restored"
+  fi
+  [[ -z "$auth_backup" ]] || rm -f "$auth_backup"
+  _codex_lock_release
+  echo "✓ ccs: switched Codex to '$target'"
+  echo "  restart the current shell if it still has the v0.2 Codex wrapper"
+}
+
+cmd_codex_edit() {
+  _codex_prepare
+  local provider="${1:-}" display base_url wire_api new_key config_tmp auth_tmp auth_backup=""
+  [[ -n "$provider" ]] || die "usage: ccs codex edit <provider>"
+  [[ "$provider" != "openai" ]] || die "the built-in 'openai' provider cannot be edited"
+  _codex_provider_exists "$provider" || die "Codex provider '$provider' not found"
+  display="$(_codex_provider_field "$provider" name)"
+  base_url="$(_codex_provider_field "$provider" base_url)"
+  wire_api="$(_codex_provider_field "$provider" wire_api)"
+  local answer
+  read -r -p "Display name [$display]: " answer; display="${answer:-$display}"
+  read -r -p "Base URL [$base_url]: " answer; base_url="${answer:-$base_url}"
+  read -r -p "Wire API [$wire_api]: " answer; wire_api="${answer:-$wire_api}"
+  [[ "$wire_api" == "responses" || "$wire_api" == "chat" ]] || die "wire API must be 'responses' or 'chat'"
+  new_key="$(_codex_read_secret 'New API key (leave blank to keep current): ')"
+  [[ -f "$CODEX_AUTH_DIR/$provider.json" || -n "$new_key" ]] || die "API key is required because this provider has no auth snapshot"
+
+  _codex_lock_acquire
+  _codex_provider_exists "$provider" || die "Codex provider '$provider' not found"
+  config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
+  _codex_config_update_provider "$provider" "$display" "$base_url" "$wire_api" "$config_tmp"
+  if [[ -n "$new_key" ]]; then
+    auth_tmp="$CODEX_AUTH_DIR/.ccs.$provider.json.tmp.$$"
+    auth_backup="$CODEX_AUTH_DIR/.ccs.$provider.json.backup.$$"
+    [[ ! -f "$CODEX_AUTH_DIR/$provider.json" ]] || cp "$CODEX_AUTH_DIR/$provider.json" "$auth_backup"
+    _codex_write_api_auth "$new_key" "$auth_tmp"
+    mv "$auth_tmp" "$CODEX_AUTH_DIR/$provider.json"
+  fi
+  if ! mv "$config_tmp" "$CODEX_CONFIG"; then
+    if [[ -n "$auth_backup" && -f "$auth_backup" ]]; then
+      mv "$auth_backup" "$CODEX_AUTH_DIR/$provider.json"
+    elif [[ -n "$new_key" ]]; then
+      rm -f "$CODEX_AUTH_DIR/$provider.json"
+    fi
+    die "failed to update $CODEX_CONFIG; provider auth was restored"
+  fi
+  [[ -z "$auth_backup" || ! -f "$auth_backup" ]] || rm -f "$auth_backup"
+  _codex_lock_release
+  echo "✓ ccs: updated Codex provider '$provider'"
+}
+
+cmd_codex_rm() {
+  _codex_prepare
+  local provider="${1:-}" answer config_tmp auth_backup=""
+  [[ -n "$provider" ]] || die "usage: ccs codex rm <provider>"
+  [[ "$provider" != "openai" ]] || die "the built-in 'openai' provider cannot be removed"
+  _codex_provider_exists "$provider" || die "Codex provider '$provider' not found"
+  [[ "$provider" != "$(_codex_current_raw)" ]] || die "cannot remove active provider '$provider'; switch first"
+  read -r -p "Remove Codex provider '$provider'? [y/N] " answer
+  [[ "$answer" == "y" || "$answer" == "Y" ]] || { echo "Cancelled."; return 0; }
+  _codex_lock_acquire
+  _codex_provider_exists "$provider" || die "Codex provider '$provider' not found"
+  [[ "$provider" != "$(_codex_current_raw)" ]] || die "cannot remove active provider '$provider'; switch first"
+  config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
+  _codex_config_without_provider "$provider" "$config_tmp"
+  if [[ -f "$CODEX_AUTH_DIR/$provider.json" ]]; then
+    auth_backup="$CODEX_AUTH_DIR/.ccs.$provider.json.removed.$$"
+    mv "$CODEX_AUTH_DIR/$provider.json" "$auth_backup"
+  fi
+  if ! mv "$config_tmp" "$CODEX_CONFIG"; then
+    [[ -z "$auth_backup" ]] || mv "$auth_backup" "$CODEX_AUTH_DIR/$provider.json"
+    die "failed to update $CODEX_CONFIG; provider auth was restored"
+  fi
+  [[ -z "$auth_backup" ]] || rm -f "$auth_backup"
+  _codex_lock_release
+  echo "✓ ccs: removed Codex provider '$provider'"
+}
+
+cmd_codex_removed() {
+  die "'ccs codex $1' was removed in v0.3; provider switching now writes ~/.codex/config.toml and auth.json directly"
+}
+
+cmd_codex_login() {
+  _codex_prepare
+  _codex_native_login
+}
 
 cmd_codex_help() {
   cat <<EOF
-ccs codex — Codex provider switch
+ccs codex — manage Codex providers without shell environment variables
 
 Usage:
-  ccs codex list              List Codex profiles
-  ccs codex current           Show active Codex profile
-  ccs codex use <name>        Switch provider (current terminal + persist)
-  ccs codex env <name>        Source provider in current terminal only
-  ccs codex new <provider>    Add provider template and profile
-  ccs codex edit <name>       Edit a Codex profile
-  ccs codex rm <name>         Remove a Codex profile
-  ccs codex show [<name>]     Show profile (sensitive values masked)
-  ccs codex unset             Clear Codex profile env vars
-  ccs codex path              Print Codex profiles directory
+  ccs codex list              List providers and saved auth
+  ccs codex current           Show the active provider
+  ccs codex use <name>        Switch config.toml and auth.json atomically
+  ccs codex new <provider>    Create a provider interactively
+  ccs codex new openai        Create an official ChatGPT subscription login
+  ccs codex login             Sign in to OpenAI again and refresh its snapshot
+  ccs codex edit <name>       Edit provider settings and optionally its API key
+  ccs codex rm <name>         Remove an inactive provider
+  ccs codex show [<name>]     Show provider metadata (secrets masked)
+
+Files:
+  Config:     $CODEX_CONFIG
+  Active auth: $CODEX_AUTH
+  Auth store: $CODEX_AUTH_DIR
 EOF
 }
 
@@ -372,10 +729,11 @@ cmd_codex() {
   local sub="${1:-help}"; shift 2>/dev/null || true
   case "$sub" in
     list|ls) cmd_codex_list ;; current|c) cmd_codex_current ;;
-    use|sw|switch) cmd_codex_use "$@" ;; env|source|src) cmd_codex_source "$@" ;;
-    new|create) cmd_codex_new "$@" ;; edit|e) cmd_codex_edit "$@" ;;
-    rm|remove) cmd_codex_rm "$@" ;; unset|off) cmd_codex_unset ;;
-    show) cmd_codex_show "$@" ;; path) cmd_codex_path ;;
+    use|sw|switch) cmd_codex_use "$@" ;; new|create) cmd_codex_new "$@" ;;
+    login) cmd_codex_login ;;
+    edit|e) cmd_codex_edit "$@" ;; rm|remove) cmd_codex_rm "$@" ;;
+    show) cmd_codex_show "$@" ;;
+    env|source|src|unset|off|path) cmd_codex_removed "$sub" ;;
     help|-h|--help) cmd_codex_help ;; *) die "ccs codex: unknown command '$sub'" ;;
   esac
 }
@@ -416,13 +774,13 @@ Usage:
   ccs update            Update ccs to latest version
   ccs path              Print profiles directory
   ccs version           Print version
-  ccs codex ...         Manage Codex provider profiles (run 'ccs codex help')
+  ccs codex ...         Manage Codex provider files (run 'ccs codex help')
   ccs help              This message
 
 Profiles: $CCS_DIR
 State:    $CURRENT
-Codex profiles: $CCS_CODEX_DIR
-Codex state:    $CODEX_CURRENT
+Codex config:   $CODEX_CONFIG
+Codex auth:     $CODEX_AUTH
 Version:  $VERSION
 EOF
 }

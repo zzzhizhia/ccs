@@ -5,40 +5,8 @@ function ccs
   switch "$argv[1]"
     case use sw switch env source src unset off
       eval (command ccs.sh $argv)
-    case codex
-      switch "$argv[2]"
-        case use sw switch env source src unset off
-          eval (command ccs.sh $argv)
-        case '*'
-          command ccs.sh $argv
-      end
     case '*'
       command ccs.sh $argv
-  end
-end
-function codex
-  set -l provider "$CCS_CODEX_PROVIDER"
-  set -l explicit 0
-  set -l next_config 0
-  for arg in $argv
-    if test $next_config -eq 1
-      string match -q 'model_provider=*' -- $arg; and set explicit 1
-      set next_config 0
-      continue
-    end
-    switch $arg
-      case -p --profile '--profile=*'
-        set explicit 1
-      case -c --config
-        set next_config 1
-      case '--config=model_provider=*' 'model_provider=*' 'model_provider =*'
-        set explicit 1
-    end
-  end
-  if test -n "$provider"; and test $explicit -eq 0
-    command codex -c "model_provider=\"$provider\"" $argv
-  else
-    command codex $argv
   end
 end
 set -gx CCS_STATE (test -n "$XDG_STATE_HOME"; and echo "$XDG_STATE_HOME"; or echo "$HOME/.local/state")/ccs
@@ -55,9 +23,5 @@ if test -f "$CCS_STATE/current"
       chmod +x "$sl_dst"
     end
   end
-end
-set -l CCS_CODEX_STATE (test -n "$XDG_STATE_HOME"; and echo "$XDG_STATE_HOME"; or echo "$HOME/.local/state")/ccs/codex
-if test -L "$CCS_CODEX_STATE/current"
-  source "$CCS_CODEX_STATE/current"
 end
 # <<< ccs <<<

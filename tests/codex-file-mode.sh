@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CCS="$ROOT/ccs.sh"
+JQ_BIN="$(type -P jq)"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_file() { [[ -f "$1" ]] || fail "missing file: $1"; }
@@ -19,31 +20,48 @@ printf '%s\n' \
   '' \
   '[features]' \
   'unified_exec = true' > "$TEST_HOME/.codex/config.toml"
-jq -n '{auth_mode:"chatgpt",OPENAI_API_KEY:null,tokens:{access_token:"access",refresh_token:"refresh"}}' \
+jq -n '{
+  auth_mode:"chatgpt",
+  OPENAI_API_KEY:null,
+  tokens:{
+    access_token:"e30.eyJzdWIiOiJ1c2VyIn0.sig",
+    id_token:"e30.eyJzdWIiOiJ1c2VyIiwiZW1haWwiOiJ0ZXN0QGV4YW1wbGUuY29tIn0.sig",
+    refresh_token:"refresh",
+    account_id:"account"
+  }
+}' \
   > "$TEST_HOME/.codex/auth.json"
 chmod 600 "$TEST_HOME/.codex/auth.json"
 
 HOME="$TEST_HOME" bash "$CCS" codex list >/dev/null
 assert_file "$TEST_HOME/.codex/ccs-auth/openai.json"
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/ccs-auth/openai.json")" "refresh"
+assert_file "$TEST_HOME/.codex/ccs-auth/.migrated-v2"
 
 printf '\nhttps://proxy.example/v1\n\nproxy-key\n' \
   | HOME="$TEST_HOME" bash "$CCS" codex new proxy >/dev/null
 assert_contains "$TEST_HOME/.codex/config.toml" '[model_providers.proxy]'
-assert_contains "$TEST_HOME/.codex/config.toml" 'requires_openai_auth = true'
+assert_contains "$TEST_HOME/.codex/config.toml" 'requires_openai_auth = false'
 assert_not_contains "$TEST_HOME/.codex/config.toml" 'env_key ='
+assert_contains "$TEST_HOME/.codex/config.toml" '[model_providers.proxy.auth]'
+assert_contains "$TEST_HOME/.codex/config.toml" "command = \"$JQ_BIN\""
+assert_contains "$TEST_HOME/.codex/config.toml" \
+  "args = [\"-er\", \".OPENAI_API_KEY | strings | select(length > 0)\", \"$TEST_HOME/.codex/ccs-auth/proxy.json\"]"
 assert_eq "$(jq -r '.OPENAI_API_KEY' "$TEST_HOME/.codex/ccs-auth/proxy.json")" "proxy-key"
+assert_eq "$("$JQ_BIN" -er '.OPENAI_API_KEY | strings | select(length > 0)' "$TEST_HOME/.codex/ccs-auth/proxy.json")" "proxy-key"
+assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/auth.json")" "refresh"
 assert_eq "$(stat -f '%Lp' "$TEST_HOME/.codex/ccs-auth/proxy.json")" "600"
 assert_eq "$(stat -f '%Lp' "$TEST_HOME/.codex/ccs-auth")" "700"
 
 HOME="$TEST_HOME" bash "$CCS" codex use proxy >/dev/null
 assert_contains "$TEST_HOME/.codex/config.toml" 'model_provider = "proxy"'
-assert_eq "$(jq -r '.OPENAI_API_KEY' "$TEST_HOME/.codex/auth.json")" "proxy-key"
+assert_eq "$(jq -r '.auth_mode' "$TEST_HOME/.codex/auth.json")" "chatgpt"
+assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/auth.json")" "refresh"
 assert_contains "$TEST_HOME/.codex/config.toml" 'model = "gpt-test"'
 assert_contains "$TEST_HOME/.codex/config.toml" 'unified_exec = true'
 if CODEX_BIN="$(type -P codex 2>/dev/null)" && [[ -n "$CODEX_BIN" ]]; then
-  CODEX_HOME="$TEST_HOME/.codex" "$CODEX_BIN" login status 2>&1 | grep -qi 'API key' \
-    || fail "real Codex CLI did not accept generated API-key auth"
+  CODEX_HOME="$TEST_HOME/.codex" "$CODEX_BIN" login status 2>&1 | grep -qi 'ChatGPT' \
+    || fail "real Codex CLI did not preserve ChatGPT auth with a custom provider"
 fi
 
 HOME="$TEST_HOME" bash "$CCS" codex use openai >/dev/null
@@ -53,6 +71,8 @@ assert_eq "$(HOME="$TEST_HOME" bash "$CCS" codex current)" "openai"
 printf '\nhttps://proxy.example/v2\n\nproxy-key-2\n' \
   | HOME="$TEST_HOME" bash "$CCS" codex edit proxy >/dev/null
 assert_contains "$TEST_HOME/.codex/config.toml" 'base_url = "https://proxy.example/v2"'
+assert_contains "$TEST_HOME/.codex/config.toml" 'requires_openai_auth = false'
+assert_eq "$(grep -cF '[model_providers.proxy.auth]' "$TEST_HOME/.codex/config.toml")" "1"
 assert_eq "$(jq -r '.OPENAI_API_KEY' "$TEST_HOME/.codex/ccs-auth/proxy.json")" "proxy-key-2"
 show_output="$(HOME="$TEST_HOME" bash "$CCS" codex show proxy)"
 [[ "$show_output" == *'api_key:  ***'* ]] || fail "show did not mask API key"
@@ -90,9 +110,10 @@ fi
 HOME="$TEST_HOME" bash "$CCS" codex use openai >/dev/null
 printf 'y\n' | HOME="$TEST_HOME" bash "$CCS" codex rm proxy >/dev/null
 assert_not_contains "$TEST_HOME/.codex/config.toml" '[model_providers.proxy]'
+assert_not_contains "$TEST_HOME/.codex/config.toml" '[model_providers.proxy.auth]'
 [[ ! -e "$TEST_HOME/.codex/ccs-auth/proxy.json" ]] || fail "proxy auth snapshot still exists"
 
-# v0.2 migration: preserve ChatGPT, import API key, restore the formerly active provider.
+# v0.2 migration: preserve ChatGPT, import API key, and retain the formerly active provider.
 MIGRATE_HOME="$(mktemp -d)"
 mkdir -p "$MIGRATE_HOME/.codex" "$MIGRATE_HOME/.config/ccs/codex/profiles" "$MIGRATE_HOME/.local/state/ccs/codex"
 printf '%s\n' \
@@ -112,15 +133,52 @@ printf '%s\n' \
 ln -s "$MIGRATE_HOME/.config/ccs/codex/profiles/of.env" "$MIGRATE_HOME/.local/state/ccs/codex/current"
 
 assert_eq "$(HOME="$MIGRATE_HOME" bash "$CCS" codex current 2>/dev/null)" "of"
-assert_eq "$(jq -r '.OPENAI_API_KEY' "$MIGRATE_HOME/.codex/auth.json")" "legacy-key"
+assert_eq "$(jq -r '.auth_mode' "$MIGRATE_HOME/.codex/auth.json")" "chatgpt"
+assert_eq "$(jq -r '.tokens.refresh_token' "$MIGRATE_HOME/.codex/auth.json")" "chatgpt-refresh"
 assert_eq "$(jq -r '.tokens.refresh_token' "$MIGRATE_HOME/.codex/ccs-auth/openai.json")" "chatgpt-refresh"
 assert_not_contains "$MIGRATE_HOME/.codex/config.toml" 'env_key ='
-assert_contains "$MIGRATE_HOME/.codex/config.toml" 'requires_openai_auth = true'
+assert_contains "$MIGRATE_HOME/.codex/config.toml" 'requires_openai_auth = false'
+assert_contains "$MIGRATE_HOME/.codex/config.toml" '[model_providers.of.auth]'
+assert_contains "$MIGRATE_HOME/.codex/config.toml" "command = \"$JQ_BIN\""
+assert_contains "$MIGRATE_HOME/.codex/config.toml" \
+  "args = [\"-er\", \".OPENAI_API_KEY | strings | select(length > 0)\", \"$MIGRATE_HOME/.codex/ccs-auth/of.json\"]"
+assert_eq "$("$JQ_BIN" -er '.OPENAI_API_KEY | strings | select(length > 0)' "$MIGRATE_HOME/.codex/ccs-auth/of.json")" "legacy-key"
 assert_contains "$MIGRATE_HOME/.codex/config.toml" 'request_max_retries = 7'
-assert_file "$MIGRATE_HOME/.codex/ccs-auth/.migrated-v1"
+assert_file "$MIGRATE_HOME/.codex/ccs-auth/.migrated-v2"
 compgen -G "$MIGRATE_HOME/.config/ccs/codex/profiles.migrated-*" >/dev/null \
   || fail "legacy profiles backup missing"
 assert_eq "$(HOME="$MIGRATE_HOME" bash "$CCS" codex current 2>/dev/null)" "of"
+
+# v0.3 migration: convert auth snapshots to command auth and restore ChatGPT globally.
+V3_HOME="$(mktemp -d)"
+mkdir -p "$V3_HOME/.codex/ccs-auth"
+printf '%s\n' \
+  'model_provider = "proxy"' \
+  '' \
+  '[model_providers.proxy]' \
+  'name = "proxy"' \
+  'base_url = "https://proxy.example/v1"' \
+  'wire_api = "responses"' \
+  'requires_openai_auth = true' > "$V3_HOME/.codex/config.toml"
+jq -n --arg key 'proxy-key' '{auth_mode:"apikey",OPENAI_API_KEY:$key}' \
+  > "$V3_HOME/.codex/auth.json"
+jq -n '{auth_mode:"chatgpt",OPENAI_API_KEY:null,tokens:{refresh_token:"v3-refresh"}}' \
+  > "$V3_HOME/.codex/ccs-auth/openai.json"
+jq -n --arg key 'proxy-key' '{auth_mode:"apikey",OPENAI_API_KEY:$key}' \
+  > "$V3_HOME/.codex/ccs-auth/proxy.json"
+: > "$V3_HOME/.codex/ccs-auth/.migrated-v1"
+chmod 600 "$V3_HOME/.codex/auth.json" "$V3_HOME/.codex/ccs-auth/"*.json
+
+assert_eq "$(HOME="$V3_HOME" bash "$CCS" codex current)" "proxy"
+assert_contains "$V3_HOME/.codex/config.toml" 'requires_openai_auth = false'
+assert_contains "$V3_HOME/.codex/config.toml" '[model_providers.proxy.auth]'
+assert_eq "$(jq -r '.auth_mode' "$V3_HOME/.codex/auth.json")" "chatgpt"
+assert_eq "$(jq -r '.tokens.refresh_token' "$V3_HOME/.codex/auth.json")" "v3-refresh"
+assert_contains "$V3_HOME/.codex/config.toml" "command = \"$JQ_BIN\""
+assert_contains "$V3_HOME/.codex/config.toml" \
+  "args = [\"-er\", \".OPENAI_API_KEY | strings | select(length > 0)\", \"$V3_HOME/.codex/ccs-auth/proxy.json\"]"
+assert_eq "$("$JQ_BIN" -er '.OPENAI_API_KEY | strings | select(length > 0)' "$V3_HOME/.codex/ccs-auth/proxy.json")" "proxy-key"
+assert_file "$V3_HOME/.codex/ccs-auth/.migrated-v2"
 
 # A brand-new user can create an official subscription credential through the native login.
 NEW_USER_HOME="$(mktemp -d)"
@@ -135,8 +193,13 @@ assert_eq "$(stat -f '%Lp' "$NEW_USER_HOME/.codex/ccs-auth/openai.json")" "600"
 if HOME="$NEW_USER_HOME" PATH="$FAKE_BIN:$PATH" bash "$CCS" codex new openai >/dev/null 2>&1; then
   fail "duplicate OpenAI subscription creation succeeded"
 fi
+printf '\nhttps://proxy.example/v1\n\nnew-user-proxy-key\n' \
+  | HOME="$NEW_USER_HOME" PATH="$FAKE_BIN:$PATH" bash "$CCS" codex new proxy >/dev/null
+HOME="$NEW_USER_HOME" PATH="$FAKE_BIN:$PATH" bash "$CCS" codex use proxy >/dev/null
 HOME="$NEW_USER_HOME" PATH="$FAKE_BIN:$PATH" bash "$CCS" codex login >/dev/null
 assert_eq "$(jq -r '.tokens.account_id' "$NEW_USER_HOME/.codex/ccs-auth/openai.json")" "native-account"
+assert_eq "$(jq -r '.OPENAI_API_KEY' "$NEW_USER_HOME/.codex/ccs-auth/proxy.json")" "new-user-proxy-key"
+assert_eq "$(HOME="$NEW_USER_HOME" bash "$CCS" codex current)" "openai"
 
 # Initialization must not wrap Codex or restore Codex environment profiles.
 assert_not_contains "$ROOT/init.sh" 'codex()'

@@ -37,7 +37,7 @@ ccs version           Print version
 ccs codex new proxy   Create a provider and enter its API key
 ccs codex new openai  Create an official ChatGPT subscription login
 ccs codex login       Sign in to OpenAI again and refresh its snapshot
-ccs codex use proxy   Switch config.toml and auth.json
+ccs codex use proxy   Switch providers while keeping ChatGPT signed in
 ccs codex edit proxy  Update provider settings or rotate its API key
 ccs codex list        List providers and saved credentials
 ccs codex show proxy  Show provider metadata with secrets masked
@@ -100,13 +100,16 @@ New terminals auto-restore the last `ccs use` profile via a symlink at
 
 Codex provider switching does not use shell environment variables. `ccs codex
 new <provider>` interactively asks for the provider name, base URL, wire API,
-and API key. It writes the provider definition to `~/.codex/config.toml` and
-stores a protected auth snapshot in `~/.codex/ccs-auth/`.
+and API key. It writes a command-authenticated provider definition to
+`~/.codex/config.toml` and stores the key in a protected snapshot under
+`~/.codex/ccs-auth/`.
 
-`ccs codex use <provider>` first saves the current `~/.codex/auth.json`, then
-restores the target provider's auth and updates the top-level `model_provider`
-in `config.toml`. This also preserves the built-in `openai` provider's complete
-ChatGPT login, including refresh tokens.
+`ccs codex use <provider>` updates only the top-level `model_provider`.
+`~/.codex/auth.json` remains the official ChatGPT login so Codex Remote can
+continue authenticating the desktop host. Model requests use the selected
+provider's independent key through Codex's command-backed bearer-token support.
+Third-party providers default to `requires_openai_auth = false`, so ChatGPT
+OAuth tokens are never sent to their endpoints.
 
 For a new machine, create the official subscription credential through Codex's
 native browser login. CCS never handles the password or OAuth exchange itself;
@@ -127,14 +130,16 @@ ccs codex show proxy
 ccs codex use openai
 ```
 
-On the first v0.3 command, old Codex `.env` profiles are migrated automatically.
-The old profile directory is retained as a timestamped read-only backup. Restart
-the shell after upgrading so a v0.2 `codex()` wrapper is no longer loaded.
+On the first v0.4 command, v0.3 providers are converted to independent command
+auth and the saved ChatGPT login is restored as global Codex auth. Older Codex
+`.env` profiles are also migrated automatically, with the old profile directory
+retained as a timestamped read-only backup.
 
 Codex files:
 
 | Path | Purpose |
 |------|---------|
 | `~/.codex/config.toml` | Provider definitions and active `model_provider` |
-| `~/.codex/auth.json` | Credentials currently used by Codex |
-| `~/.codex/ccs-auth/<provider>.json` | Protected per-provider auth snapshots |
+| `~/.codex/auth.json` | Official ChatGPT login used by Codex and Remote |
+| `~/.codex/ccs-auth/openai.json` | Protected backup of the complete ChatGPT login |
+| `~/.codex/ccs-auth/<provider>.json` | Protected third-party key read through command auth |

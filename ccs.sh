@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -22,7 +22,7 @@ CODEX_CONFIG="$CODEX_DIR/config.toml"
 CODEX_AUTH="$CODEX_DIR/auth.json"
 CODEX_AUTH_DIR="$CODEX_DIR/ccs-auth"
 CODEX_LOCK="$CODEX_DIR/.ccs.lock"
-CODEX_MIGRATION_MARKER="$CODEX_AUTH_DIR/.migrated-v1"
+CODEX_MIGRATION_MARKER="$CODEX_AUTH_DIR/.migrated-v2"
 
 mkdir -p "$CCS_DIR" "$CCS_STATE"
 
@@ -271,6 +271,23 @@ _codex_validate_auth() {
     || die "invalid Codex auth JSON: $file"
 }
 
+_codex_validate_provider_auth() {
+  local file="$1"
+  [[ -f "$file" ]] || die "Codex provider auth file not found: $file"
+  jq -e '
+    type == "object"
+    and .auth_mode == "apikey"
+    and (.OPENAI_API_KEY | type == "string" and length > 0)
+  ' "$file" >/dev/null 2>&1 \
+    || die "invalid Codex provider auth JSON: $file"
+}
+
+_codex_auth_is_chatgpt() {
+  local file="$1"
+  [[ -f "$file" ]] \
+    && jq -e '.auth_mode == "chatgpt" and (.tokens | type == "object")' "$file" >/dev/null 2>&1
+}
+
 _codex_atomic_copy() {
   local src="$1" dst="$2" tmp
   tmp="$(dirname "$dst")/.ccs.$(basename "$dst").tmp.$$"
@@ -304,7 +321,7 @@ _codex_provider_field() {
   awk -v section="model_providers.$provider" -v key="$field" '
     { header=$0; gsub(/[[:space:]]/, "", header) }
     header == "[" section "]" { inside=1; next }
-    inside && /^\[/ { exit }
+    inside && header ~ /^\[/ { exit }
     inside && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
       line=$0; sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*\\\"", "", line)
       sub("\\\"[[:space:]]*$", "", line); print line; exit
@@ -336,42 +353,81 @@ _codex_config_without_provider() {
   local provider="$1" output="$2"
   awk -v section="model_providers.$provider" '
     { header=$0; gsub(/[[:space:]]/, "", header) }
-    header == "[" section "]" { skip=1; next }
-    skip && /^\[/ { skip=0 }
+    header == "[" section "]" || index(header, "[" section ".") == 1 { skip=1; next }
+    skip && header ~ /^\[/ { skip=0 }
     !skip { print }
   ' "$CODEX_CONFIG" > "$output"
 }
 
 _codex_config_update_provider() {
   local provider="$1" display="$2" base_url="$3" wire_api="$4" output="$5"
+  local command_path credential_path
   display="$(_codex_toml_escape "$display")"
   base_url="$(_codex_toml_escape "$base_url")"
-  awk -v section="model_providers.$provider" -v display="$display" -v base_url="$base_url" -v wire_api="$wire_api" '
+  command_path="$(_codex_toml_escape "$(type -P jq)")"
+  credential_path="$(_codex_toml_escape "$CODEX_AUTH_DIR/$provider.json")"
+  awk \
+    -v section="model_providers.$provider" \
+    -v auth_section="model_providers.$provider.auth" \
+    -v provider="$provider" \
+    -v command_path="$command_path" \
+    -v credential_path="$credential_path" \
+    -v display="$display" \
+    -v base_url="$base_url" \
+    -v wire_api="$wire_api" '
     function missing_fields() {
       if (!seen_name) print "name = \"" display "\""
       if (!seen_base) print "base_url = \"" base_url "\""
       if (!seen_wire) print "wire_api = \"" wire_api "\""
-      if (!seen_auth) print "requires_openai_auth = true"
+      if (!seen_openai_auth) print "requires_openai_auth = false"
     }
     { header=$0; gsub(/[[:space:]]/, "", header) }
-    header == "[" section "]" { inside=1; print; next }
-    inside && /^\[/ { missing_fields(); inside=0 }
+    skipping_auth && header !~ /^\[/ { next }
+    skipping_auth { skipping_auth=0 }
+    header == "[" auth_section "]" {
+      if (inside) { missing_fields(); inside=0 }
+      skipping_auth=1
+      next
+    }
+    header == "[" section "]" {
+      inside=1
+      seen_name=seen_base=seen_wire=seen_openai_auth=0
+      print
+      next
+    }
+    inside && header ~ /^\[/ { missing_fields(); inside=0 }
     inside && /^[[:space:]]*name[[:space:]]*=/ { print "name = \"" display "\""; seen_name=1; next }
     inside && /^[[:space:]]*base_url[[:space:]]*=/ { print "base_url = \"" base_url "\""; seen_base=1; next }
     inside && /^[[:space:]]*wire_api[[:space:]]*=/ { print "wire_api = \"" wire_api "\""; seen_wire=1; next }
-    inside && /^[[:space:]]*requires_openai_auth[[:space:]]*=/ { print "requires_openai_auth = true"; seen_auth=1; next }
+    inside && /^[[:space:]]*requires_openai_auth[[:space:]]*=/ {
+      print "requires_openai_auth = false"
+      seen_openai_auth=1
+      next
+    }
     inside && /^[[:space:]]*env_key[[:space:]]*=/ { next }
+    inside && /^[[:space:]]*experimental_bearer_token[[:space:]]*=/ { next }
     { print }
-    END { if (inside) missing_fields() }
+    END {
+      if (inside) missing_fields()
+      print ""
+      print "[" auth_section "]"
+      print "command = \"" command_path "\""
+      print "args = [\"-er\", \".OPENAI_API_KEY | strings | select(length > 0)\", \"" credential_path "\"]"
+    }
   ' "$CODEX_CONFIG" > "$output"
 }
 
 _codex_append_provider() {
   local file="$1" provider="$2" display="$3" base_url="$4" wire_api="$5"
+  local command_path credential_path
+  command_path="$(_codex_toml_escape "$(type -P jq)")"
+  credential_path="$(_codex_toml_escape "$CODEX_AUTH_DIR/$provider.json")"
   [[ ! -s "$file" || "$(tail -c 1 "$file" | wc -l | tr -d ' ')" != 0 ]] || printf '\n' >> "$file"
   [[ ! -s "$file" ]] || printf '\n' >> "$file"
-  printf '[model_providers.%s]\nname = "%s"\nbase_url = "%s"\nwire_api = "%s"\nrequires_openai_auth = true\n' \
+  printf '[model_providers.%s]\nname = "%s"\nbase_url = "%s"\nwire_api = "%s"\nrequires_openai_auth = false\n\n' \
     "$provider" "$(_codex_toml_escape "$display")" "$(_codex_toml_escape "$base_url")" "$wire_api" >> "$file"
+  printf '[model_providers.%s.auth]\ncommand = "%s"\nargs = ["-er", ".OPENAI_API_KEY | strings | select(length > 0)", "%s"]\n' \
+    "$provider" "$command_path" "$credential_path" >> "$file"
 }
 
 _codex_write_api_auth() {
@@ -394,12 +450,14 @@ _codex_migrate_locked() {
 
   if [[ -f "$CODEX_AUTH" ]]; then
     _codex_validate_auth "$CODEX_AUTH"
-    [[ -f "$CODEX_AUTH_DIR/openai.json" ]] || _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/openai.json"
+    if _codex_auth_is_chatgpt "$CODEX_AUTH"; then
+      _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/openai.json"
+    fi
   fi
 
   local legacy_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ccs/codex/profiles"
   local legacy_state="${XDG_STATE_HOME:-$HOME/.local/state}/ccs/codex/current"
-  local active="" file provider key tmp stamp backup
+  local active="" file provider key tmp stamp backup display base_url wire_api config_tmp
   shopt -s nullglob
   if [[ -d "$legacy_dir" ]]; then
     for file in "$legacy_dir"/*.env; do
@@ -410,7 +468,6 @@ _codex_migrate_locked() {
       _codex_write_api_auth "$key" "$tmp"
       mv "$tmp" "$CODEX_AUTH_DIR/$provider.json"
       if _codex_provider_exists "$provider"; then
-        local display base_url wire_api config_tmp
         display="$(_codex_provider_field "$provider" name)"
         base_url="$(_codex_provider_field "$provider" base_url)"
         wire_api="$(_codex_provider_field "$provider" wire_api)"
@@ -425,10 +482,30 @@ _codex_migrate_locked() {
     active="$(basename "$(readlink "$legacy_state")" .env)"
   fi
   if [[ -n "$active" && -f "$CODEX_AUTH_DIR/$active.json" ]] && _codex_provider_exists "$active"; then
-    _codex_atomic_copy "$CODEX_AUTH_DIR/$active.json" "$CODEX_AUTH"
     tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
     _codex_config_with_current "$active" "$tmp"
     mv "$tmp" "$CODEX_CONFIG"
+  fi
+
+  # Upgrade CCS-managed v0.3 providers to independent command-backed auth.
+  # Their protected snapshots remain in place, while global auth.json is
+  # reserved for the official ChatGPT login used by Remote.
+  while IFS= read -r provider; do
+    [[ "$provider" != "openai" ]] || continue
+    [[ -f "$CODEX_AUTH_DIR/$provider.json" ]] || continue
+    _codex_validate_provider_auth "$CODEX_AUTH_DIR/$provider.json"
+    display="$(_codex_provider_field "$provider" name)"
+    base_url="$(_codex_provider_field "$provider" base_url)"
+    wire_api="$(_codex_provider_field "$provider" wire_api)"
+    config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
+    _codex_config_update_provider \
+      "$provider" "${display:-$provider}" "$base_url" "${wire_api:-responses}" "$config_tmp"
+    mv "$config_tmp" "$CODEX_CONFIG"
+  done < <(_codex_provider_names)
+
+  if _codex_auth_is_chatgpt "$CODEX_AUTH_DIR/openai.json" \
+    && ! _codex_auth_is_chatgpt "$CODEX_AUTH"; then
+    _codex_atomic_copy "$CODEX_AUTH_DIR/openai.json" "$CODEX_AUTH"
   fi
 
   stamp="$(date +%Y%m%d%H%M%S)"
@@ -468,15 +545,16 @@ _codex_read_secret() {
 }
 
 _codex_native_login() {
-  local binary current auth_backup="" snapshot_backup="" config_tmp
+  local binary auth_backup="" snapshot_backup="" config_tmp
   binary="$(type -P codex 2>/dev/null || true)"
   [[ -n "$binary" ]] || die "Codex CLI not found; install it before creating an OpenAI subscription login"
 
   _codex_lock_acquire
-  current="$(_codex_current_raw)"
   if [[ -f "$CODEX_AUTH" ]]; then
     _codex_validate_auth "$CODEX_AUTH"
-    _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/$current.json"
+    if _codex_auth_is_chatgpt "$CODEX_AUTH"; then
+      _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/openai.json"
+    fi
     auth_backup="$CODEX_DIR/.ccs.auth.json.login-backup.$$"
     cp "$CODEX_AUTH" "$auth_backup"
     chmod 600 "$auth_backup"
@@ -595,35 +673,65 @@ cmd_codex_new() {
 
 cmd_codex_use() {
   _codex_prepare
-  local target="${1:-}" current config_tmp auth_tmp auth_backup=""
+  local target="${1:-}" config_tmp auth_backup="" auth_was_missing=0
   [[ -n "$target" ]] || die "usage: ccs codex use <provider>"
   _codex_provider_exists "$target" || die "Codex provider '$target' not found"
-  _codex_validate_auth "$CODEX_AUTH_DIR/$target.json"
+  if [[ "$target" == "openai" ]]; then
+    _codex_validate_auth "$CODEX_AUTH_DIR/openai.json"
+    _codex_auth_is_chatgpt "$CODEX_AUTH_DIR/openai.json" \
+      || die "OpenAI snapshot is not a ChatGPT login; run 'ccs codex login'"
+  else
+    _codex_validate_provider_auth "$CODEX_AUTH_DIR/$target.json"
+  fi
 
   _codex_lock_acquire
   _codex_provider_exists "$target" || die "Codex provider '$target' not found"
-  _codex_validate_auth "$CODEX_AUTH_DIR/$target.json"
-  current="$(_codex_current_raw)"
+  if [[ "$target" == "openai" ]]; then
+    _codex_auth_is_chatgpt "$CODEX_AUTH_DIR/openai.json" \
+      || die "OpenAI snapshot is not a ChatGPT login; run 'ccs codex login'"
+  else
+    _codex_validate_provider_auth "$CODEX_AUTH_DIR/$target.json"
+  fi
+
   if [[ -f "$CODEX_AUTH" ]]; then
     _codex_validate_auth "$CODEX_AUTH"
-    _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/$current.json"
-    auth_backup="$CODEX_DIR/.ccs.auth.json.backup.$$"
-    cp "$CODEX_AUTH" "$auth_backup"
+    if _codex_auth_is_chatgpt "$CODEX_AUTH"; then
+      _codex_atomic_copy "$CODEX_AUTH" "$CODEX_AUTH_DIR/openai.json"
+    fi
   fi
+
+  if ! _codex_auth_is_chatgpt "$CODEX_AUTH" \
+    && _codex_auth_is_chatgpt "$CODEX_AUTH_DIR/openai.json"; then
+    if [[ -f "$CODEX_AUTH" ]]; then
+      auth_backup="$CODEX_DIR/.ccs.auth.json.backup.$$"
+      cp "$CODEX_AUTH" "$auth_backup"
+      chmod 600 "$auth_backup"
+    else
+      auth_was_missing=1
+    fi
+    _codex_atomic_copy "$CODEX_AUTH_DIR/openai.json" "$CODEX_AUTH"
+  fi
+
+  if [[ "$target" == "openai" ]] && ! _codex_auth_is_chatgpt "$CODEX_AUTH"; then
+    die "ChatGPT login is unavailable; run 'ccs codex login'"
+  fi
+
   config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
-  auth_tmp="$CODEX_DIR/.ccs.auth.json.tmp.$$"
   _codex_config_with_current "$target" "$config_tmp"
-  cp "$CODEX_AUTH_DIR/$target.json" "$auth_tmp"
-  chmod 600 "$auth_tmp"
-  mv "$auth_tmp" "$CODEX_AUTH"
   if ! mv "$config_tmp" "$CODEX_CONFIG"; then
-    [[ -n "$auth_backup" ]] && mv "$auth_backup" "$CODEX_AUTH"
-    die "failed to update $CODEX_CONFIG; auth was restored"
+    if [[ -n "$auth_backup" ]]; then
+      mv "$auth_backup" "$CODEX_AUTH"
+    elif ((auth_was_missing)); then
+      rm -f "$CODEX_AUTH"
+    fi
+    die "failed to update $CODEX_CONFIG"
   fi
   [[ -z "$auth_backup" ]] || rm -f "$auth_backup"
   _codex_lock_release
   echo "✓ ccs: switched Codex to '$target'"
-  echo "  restart the current shell if it still has the v0.2 Codex wrapper"
+  if [[ "$target" != "openai" ]] && ! _codex_auth_is_chatgpt "$CODEX_AUTH"; then
+    echo "  note: ChatGPT login is unavailable; Remote requires 'ccs codex login'"
+  fi
 }
 
 cmd_codex_edit() {
@@ -695,7 +803,7 @@ cmd_codex_rm() {
 }
 
 cmd_codex_removed() {
-  die "'ccs codex $1' was removed in v0.3; provider switching now writes ~/.codex/config.toml and auth.json directly"
+  die "'ccs codex $1' was removed in v0.3; provider switching now updates ~/.codex/config.toml directly"
 }
 
 cmd_codex_login() {
@@ -710,7 +818,7 @@ ccs codex — manage Codex providers without shell environment variables
 Usage:
   ccs codex list              List providers and saved auth
   ccs codex current           Show the active provider
-  ccs codex use <name>        Switch config.toml and auth.json atomically
+  ccs codex use <name>        Switch providers while keeping ChatGPT auth
   ccs codex new <provider>    Create a provider interactively
   ccs codex new openai        Create an official ChatGPT subscription login
   ccs codex login             Sign in to OpenAI again and refresh its snapshot
@@ -719,9 +827,9 @@ Usage:
   ccs codex show [<name>]     Show provider metadata (secrets masked)
 
 Files:
-  Config:     $CODEX_CONFIG
-  Active auth: $CODEX_AUTH
-  Auth store: $CODEX_AUTH_DIR
+  Config:       $CODEX_CONFIG
+  ChatGPT auth: $CODEX_AUTH
+  Auth store:   $CODEX_AUTH_DIR
 EOF
 }
 

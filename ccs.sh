@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -1062,7 +1062,7 @@ cmd_update() {
     fi
     return
   fi
-  curl -fsSL "$REPO/install.sh" | bash
+  exec bash -c 'curl -fsSL "$1/install.sh" | bash' _ "$REPO"
 }
 
 cmd_help() {

@@ -44,7 +44,7 @@ chmod 600 "$TEST_HOME/.codex/auth.json"
 chatgpt_auth_hash="$(shasum -a 256 "$TEST_HOME/.codex/auth.json" | cut -d' ' -f1)"
 
 HOME="$TEST_HOME" bash "$CCS" codex list >/dev/null
-assert_eq "$(bash "$CCS" version)" "ccs 0.5.0"
+assert_eq "$(bash "$CCS" version)" "ccs 0.5.1"
 assert_file "$TEST_HOME/.codex/ccs-auth/openai.json"
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/ccs-auth/openai.json")" "refresh"
 assert_file "$TEST_HOME/.codex/ccs-auth/.migrated-v2"

@@ -61,6 +61,13 @@ EOF
 
 # ── Helpers ──
 
+atomic_install() {
+  local src="$1" dst="$2" mode="$3" tmp
+  tmp="$(mktemp "$(dirname "$dst")/.ccs-install.$(basename "$dst").XXXXXX")"
+  install -m "$mode" "$src" "$tmp"
+  mv "$tmp" "$dst"
+}
+
 install_hook() {
   local rc="$1" hook="$2"
 
@@ -106,14 +113,13 @@ detect_shell() {
 # ── Install ──
 
 mkdir -p "$(dirname "$DST")"
-cp "$SRC" "$DST"
-chmod +x "$DST"
+atomic_install "$SRC" "$DST" 755
 echo "✓ ccs.sh → $DST"
 
-cp "$INIT_SRC" "$INIT"
+atomic_install "$INIT_SRC" "$INIT" 644
 echo "✓ init.sh → $INIT"
 
-cp "$INIT_FISH_SRC" "$INIT_FISH"
+atomic_install "$INIT_FISH_SRC" "$INIT_FISH" 644
 echo "✓ init.fish → $INIT_FISH"
 
 sh="$(detect_shell)"

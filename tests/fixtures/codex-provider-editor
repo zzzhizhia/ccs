@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+file="${!#}"
+mode="${CCS_TEST_EDITOR_MODE:-success}"
+
+case "$mode" in
+  fail)
+    exit 42
+    ;;
+  rename)
+    awk '
+      /^\[model_providers\.[A-Za-z_][A-Za-z0-9_-]*\]$/ && !renamed {
+        print "[model_providers.renamed]"
+        renamed=1
+        next
+      }
+      { print }
+    ' "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+    exit 0
+    ;;
+esac
+
+provider="$(
+  sed -nE 's/^[[:space:]]*\[model_providers\.([A-Za-z_][A-Za-z0-9_-]*)\][[:space:]]*$/\1/p' \
+    "$file" | head -n 1
+)"
+[[ -n "$provider" ]]
+
+base_url="${CCS_TEST_BASE_URL:-https://proxy.example/v1}"
+display_name="${CCS_TEST_DISPLAY_NAME:-Editor Provider}"
+wire_api="${CCS_TEST_WIRE_API:-responses}"
+retry_count="${CCS_TEST_RETRY_COUNT:-}"
+requires_openai_auth="${CCS_TEST_REQUIRES_OPENAI_AUTH:-false}"
+
+if grep -qE '^[[:space:]]*request_max_retries[[:space:]]*=' "$file"; then
+  has_retry=1
+else
+  has_retry=0
+fi
+
+awk \
+  -v section="model_providers.$provider" \
+  -v base_url="$base_url" \
+  -v display_name="$display_name" \
+  -v wire_api="$wire_api" \
+  -v retry_count="$retry_count" \
+  -v requires_openai_auth="$requires_openai_auth" \
+  -v has_retry="$has_retry" '
+  {
+    header=$0
+    sub(/[[:space:]]*#.*/, "", header)
+    gsub(/[[:space:]]/, "", header)
+  }
+  header ~ /^\[/ { inside=(header == "[" section "]") }
+  inside && /^[[:space:]]*name[[:space:]]*=/ {
+    print "name = \"" display_name "\""
+    next
+  }
+  inside && /^[[:space:]]*base_url[[:space:]]*=/ {
+    print "base_url = \"" base_url "\""
+    next
+  }
+  inside && /^[[:space:]]*wire_api[[:space:]]*=/ {
+    print "wire_api = \"" wire_api "\""
+    next
+  }
+  inside && /^[[:space:]]*request_max_retries[[:space:]]*=/ {
+    if (retry_count != "") print "request_max_retries = " retry_count
+    next
+  }
+  inside && /^[[:space:]]*requires_openai_auth[[:space:]]*=/ {
+    print "requires_openai_auth = " requires_openai_auth
+    if (retry_count != "" && !has_retry) print "request_max_retries = " retry_count
+    next
+  }
+  { print }
+' "$file" > "$file.tmp"
+mv "$file.tmp" "$file"
+
+if [[ "$mode" == "auth-table" ]]; then
+  printf '\n[model_providers.%s.auth]\ncommand = "not-allowed"\n' "$provider" >> "$file"
+fi
+
+if [[ "$mode" == "concurrent" ]]; then
+  config="$HOME/.codex/config.toml"
+  concurrent_url="${CCS_TEST_CONCURRENT_URL:-https://concurrent.example/v1}"
+  awk -v section="model_providers.$provider" -v base_url="$concurrent_url" '
+    {
+      header=$0
+      sub(/[[:space:]]*#.*/, "", header)
+      gsub(/[[:space:]]/, "", header)
+    }
+    header ~ /^\[/ { inside=(header == "[" section "]") }
+    inside && /^[[:space:]]*base_url[[:space:]]*=/ {
+      print "base_url = \"" base_url "\""
+      next
+    }
+    { print }
+  ' "$config" > "$config.tmp"
+  mv "$config.tmp" "$config"
+fi

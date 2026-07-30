@@ -34,11 +34,11 @@ ccs statusline unbind deepseek Remove a statusline binding
 ccs statusline show deepseek   Show a profile's statusline
 ccs path              Print profiles directory
 ccs version           Print version
-ccs codex new proxy   Create a provider and enter its API key
+ccs codex new proxy   Create a provider in $EDITOR, then enter its API key
 ccs codex new openai  Create an official ChatGPT subscription login
 ccs codex login       Sign in to OpenAI again and refresh its snapshot
 ccs codex use proxy   Switch providers while keeping ChatGPT signed in
-ccs codex edit proxy  Update provider settings or rotate its API key
+ccs codex edit proxy  Edit provider TOML, then optionally rotate its API key
 ccs codex list        List providers and saved credentials
 ccs codex show proxy  Show provider metadata with secrets masked
 ```
@@ -99,10 +99,19 @@ New terminals auto-restore the last `ccs use` profile via a symlink at
 ## Codex providers
 
 Codex provider switching does not use shell environment variables. `ccs codex
-new <provider>` interactively asks for the provider name, base URL, wire API,
-and API key. It writes a command-authenticated provider definition to
-`~/.codex/config.toml` and stores the key in a protected snapshot under
-`~/.codex/ccs-auth/`.
+new <provider>` opens a temporary TOML fragment in `${EDITOR:-vim}` with the
+provider name, an empty `base_url`, `wire_api = "responses"`, and
+`requires_openai_auth = false`. After the editor exits, CCS validates the
+fragment and prompts for the API key separately with hidden terminal input.
+Only then does it atomically merge the provider into `~/.codex/config.toml`
+and store the key in a protected snapshot under `~/.codex/ccs-auth/`.
+
+`ccs codex edit <provider>` opens only that provider's TOML tables, not the
+complete Codex config. Other providers and top-level settings are preserved.
+After editing, enter a new API key to rotate it or leave the prompt blank to
+keep the saved key. Provider names cannot be changed in the editor; remove and
+recreate a provider to rename it. The command-backed `.auth` table is managed
+by CCS and is regenerated after every successful edit.
 
 `ccs codex use <provider>` updates only the top-level `model_provider`.
 `~/.codex/auth.json` remains the official ChatGPT login so Codex Remote can

@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -23,6 +23,8 @@ CODEX_AUTH="$CODEX_DIR/auth.json"
 CODEX_AUTH_DIR="$CODEX_DIR/ccs-auth"
 CODEX_LOCK="$CODEX_DIR/.ccs.lock"
 CODEX_MIGRATION_MARKER="$CODEX_AUTH_DIR/.migrated-v2"
+CODEX_LOCK_HELD=0
+CODEX_TEMP_FILES=()
 
 mkdir -p "$CCS_DIR" "$CCS_STATE"
 
@@ -251,17 +253,42 @@ _codex_init_dirs() {
   [[ -f "$CODEX_CONFIG" ]] || : > "$CODEX_CONFIG"
 }
 
+_codex_cleanup() {
+  local file
+  for file in "${CODEX_TEMP_FILES[@]}"; do
+    rm -f "$file"
+  done
+  if ((CODEX_LOCK_HELD)); then
+    rmdir "$CODEX_LOCK" 2>/dev/null || true
+    CODEX_LOCK_HELD=0
+  fi
+}
+
+_codex_install_cleanup_trap() {
+  trap '_codex_cleanup' EXIT
+  trap '_codex_cleanup; exit 130' HUP INT TERM
+}
+
+_codex_register_temp() {
+  CODEX_TEMP_FILES+=("$1")
+  _codex_install_cleanup_trap
+}
+
 _codex_lock_acquire() {
   _codex_init_dirs
   if ! mkdir "$CODEX_LOCK" 2>/dev/null; then
     die "another ccs codex operation is running (lock: $CODEX_LOCK)"
   fi
-  trap '_codex_lock_release' EXIT HUP INT TERM
+  CODEX_LOCK_HELD=1
+  _codex_install_cleanup_trap
 }
 
 _codex_lock_release() {
-  rmdir "$CODEX_LOCK" 2>/dev/null || true
-  trap - EXIT HUP INT TERM
+  if ((CODEX_LOCK_HELD)); then
+    rmdir "$CODEX_LOCK" 2>/dev/null || true
+    CODEX_LOCK_HELD=0
+  fi
+  ((${#CODEX_TEMP_FILES[@]} > 0)) || trap - EXIT HUP INT TERM
 }
 
 _codex_validate_auth() {
@@ -305,13 +332,13 @@ _codex_current_raw() {
 _codex_provider_exists() {
   local name="$1"
   [[ "$name" == "openai" ]] && return 0
-  grep -qE "^[[:space:]]*\[model_providers\.${name}\][[:space:]]*$" "$CODEX_CONFIG"
+  grep -qE "^[[:space:]]*\[model_providers\.${name}\][[:space:]]*(#.*)?$" "$CODEX_CONFIG"
 }
 
 _codex_provider_names() {
   {
     echo openai
-    sed -nE 's/^[[:space:]]*\[model_providers\.([A-Za-z_][A-Za-z0-9_-]*)\][[:space:]]*$/\1/p' "$CODEX_CONFIG"
+    sed -nE 's/^[[:space:]]*\[model_providers\.([A-Za-z_][A-Za-z0-9_-]*)\][[:space:]]*(#.*)?$/\1/p' "$CODEX_CONFIG"
   } | awk '!seen[$0]++'
 }
 
@@ -319,12 +346,21 @@ _codex_provider_field() {
   local provider="$1" field="$2"
   [[ "$provider" == "openai" ]] && { [[ "$field" == "name" ]] && echo OpenAI; return; }
   awk -v section="model_providers.$provider" -v key="$field" '
-    { header=$0; gsub(/[[:space:]]/, "", header) }
+    { header=$0; sub(/[[:space:]]*#.*/, "", header); gsub(/[[:space:]]/, "", header) }
     header == "[" section "]" { inside=1; next }
     inside && header ~ /^\[/ { exit }
     inside && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
-      line=$0; sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*\\\"", "", line)
-      sub("\\\"[[:space:]]*$", "", line); print line; exit
+      line=$0
+      sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "", line)
+      sub(/[[:space:]]+#.*/, "", line)
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      quote=substr(line, 1, 1)
+      if ((quote == "\"" || quote == sprintf("%c", 39)) && substr(line, length(line), 1) == quote) {
+        line=substr(line, 2, length(line) - 2)
+      }
+      print line
+      exit
     }
   ' "$CODEX_CONFIG"
 }
@@ -352,11 +388,177 @@ _codex_config_with_current() {
 _codex_config_without_provider() {
   local provider="$1" output="$2"
   awk -v section="model_providers.$provider" '
-    { header=$0; gsub(/[[:space:]]/, "", header) }
+    { header=$0; sub(/[[:space:]]*#.*/, "", header); gsub(/[[:space:]]/, "", header) }
     header == "[" section "]" || index(header, "[" section ".") == 1 { skip=1; next }
     skip && header ~ /^\[/ { skip=0 }
     !skip { print }
   ' "$CODEX_CONFIG" > "$output"
+}
+
+_codex_extract_provider_fragment() {
+  local provider="$1" input="$2" output="$3"
+  awk \
+    -v section="model_providers.$provider" \
+    -v auth_section="model_providers.$provider.auth" '
+    {
+      header=$0
+      sub(/[[:space:]]*#.*/, "", header)
+      gsub(/[[:space:]]/, "", header)
+    }
+    header ~ /^\[/ {
+      include=(header == "[" section "]" || index(header, "[" section ".") == 1)
+      if (header == "[" auth_section "]" || index(header, "[" auth_section ".") == 1) {
+        include=0
+      }
+    }
+    include { print }
+  ' "$input" > "$output"
+}
+
+_codex_file_fingerprint() {
+  cksum "$1" | awk '{ print $1 ":" $2 }'
+}
+
+_codex_validate_provider_fragment() {
+  local provider="$1" file="$2" result
+  result="$(
+    awk -v section="model_providers.$provider" '
+      function trim(value) {
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        return value
+      }
+      function clean_value(value, quote, i, char, escaped, tail) {
+        value=trim(value)
+        quote=substr(value, 1, 1)
+        if (quote == "\"" || quote == sprintf("%c", 39)) {
+          escaped=0
+          for (i=2; i<=length(value); i++) {
+            char=substr(value, i, 1)
+            if (char == quote && !escaped) {
+              tail=trim(substr(value, i + 1))
+              if (tail == "" || substr(tail, 1, 1) == "#") return substr(value, 1, i)
+              return "__CCS_INVALID_VALUE__"
+            }
+            if (char == "\\" && !escaped) escaped=1
+            else escaped=0
+          }
+        }
+        sub(/[[:space:]]+#.*/, "", value)
+        return trim(value)
+      }
+      function field_value(key, line, value) {
+        value=line
+        sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "", value)
+        return clean_value(value)
+      }
+      function quoted_nonempty(value, quote, inner) {
+        if (length(value) < 3) return 0
+        quote=substr(value, 1, 1)
+        inner=substr(value, 2, length(value) - 2)
+        return (quote == "\"" || quote == sprintf("%c", 39)) \
+          && substr(value, length(value), 1) == quote \
+          && inner ~ /[^[:space:]]/
+      }
+      {
+        header=$0
+        sub(/[[:space:]]*#.*/, "", header)
+        gsub(/[[:space:]]/, "", header)
+      }
+      header ~ /^\[/ {
+        if (header == "[" section "]") {
+          main_count++
+          inside=1
+          seen_main=1
+        } else if (index(header, "[" section ".") == 1) {
+          if (!seen_main) bad_order=1
+          if (header == "[" section ".auth]" || index(header, "[" section ".auth.") == 1) {
+            auth_table=1
+          }
+          inside=0
+        } else {
+          other_table=1
+          inside=0
+        }
+        next
+      }
+      inside && /^[[:space:]]*base_url[[:space:]]*=/ {
+        base_count++
+        base_value=field_value("base_url", $0)
+        next
+      }
+      inside && /^[[:space:]]*wire_api[[:space:]]*=/ {
+        wire_count++
+        wire_value=field_value("wire_api", $0)
+        next
+      }
+      inside && /^[[:space:]]*requires_openai_auth[[:space:]]*=/ {
+        openai_auth_count++
+        openai_auth_value=field_value("requires_openai_auth", $0)
+        next
+      }
+      inside && /^[[:space:]]*(env_key|experimental_bearer_token)[[:space:]]*=/ {
+        unmanaged_auth=1
+      }
+      END {
+        if (main_count != 1) print "main"
+        else if (other_table) print "other-table"
+        else if (bad_order) print "order"
+        else if (auth_table) print "auth-table"
+        else if (base_count != 1 || !quoted_nonempty(base_value)) print "base-url"
+        else if (wire_count != 1) print "wire-api"
+        else if (wire_value != "\"responses\"" && wire_value != "\"chat\"" && wire_value != sprintf("%c", 39) "responses" sprintf("%c", 39) && wire_value != sprintf("%c", 39) "chat" sprintf("%c", 39)) print "wire-api"
+        else if (openai_auth_count != 1 || openai_auth_value != "false") print "openai-auth"
+        else if (unmanaged_auth) print "unmanaged-auth"
+        else print "ok"
+      }
+    ' "$file"
+  )"
+
+  case "$result" in
+    ok) return 0 ;;
+    main) die "provider fragment must contain exactly one [model_providers.$provider] table" ;;
+    other-table) die "provider fragment may only contain tables for 'model_providers.$provider'" ;;
+    order) die "provider sub-tables must appear after [model_providers.$provider]" ;;
+    auth-table) die "provider auth is managed by CCS and cannot be edited in the TOML fragment" ;;
+    base-url) die "provider fragment must contain exactly one non-empty quoted base_url" ;;
+    wire-api) die "provider fragment must contain exactly one wire_api set to 'responses' or 'chat'" ;;
+    openai-auth) die "provider fragment must contain exactly one requires_openai_auth = false" ;;
+    unmanaged-auth) die "env_key and experimental_bearer_token are managed by CCS and cannot be set in the fragment" ;;
+    *) die "invalid Codex provider fragment" ;;
+  esac
+}
+
+_codex_new_provider_fragment() {
+  local provider="$1" output="$2"
+  printf '[model_providers.%s]\nname = "%s"\nbase_url = ""\nwire_api = "responses"\nrequires_openai_auth = false\n' \
+    "$provider" "$(_codex_toml_escape "$provider")" > "$output"
+}
+
+_codex_open_provider_fragment() {
+  local provider="$1" file="$2"
+  echo "ccs: opening Codex provider '$provider' in ${EDITOR:-vim}; the API key will be requested afterward." >&2
+  if ! ${EDITOR:-vim} "$file"; then
+    die "editor exited without saving Codex provider '$provider'"
+  fi
+}
+
+_codex_append_managed_auth() {
+  local file="$1" provider="$2" command_path credential_path
+  command_path="$(_codex_toml_escape "$(type -P jq)")"
+  credential_path="$(_codex_toml_escape "$CODEX_AUTH_DIR/$provider.json")"
+  printf '\n[model_providers.%s.auth]\ncommand = "%s"\nargs = ["-er", ".OPENAI_API_KEY | strings | select(length > 0)", "%s"]\n' \
+    "$provider" "$command_path" "$credential_path" >> "$file"
+}
+
+_codex_merge_provider_fragment() {
+  local provider="$1" fragment="$2" output="$3"
+  _codex_config_without_provider "$provider" "$output"
+  [[ ! -s "$output" || "$(tail -c 1 "$output" | wc -l | tr -d ' ')" != 0 ]] || printf '\n' >> "$output"
+  [[ ! -s "$output" ]] || printf '\n' >> "$output"
+  cat "$fragment" >> "$output"
+  [[ "$(tail -c 1 "$output" | wc -l | tr -d ' ')" != 0 ]] || printf '\n' >> "$output"
+  _codex_append_managed_auth "$output" "$provider"
 }
 
 _codex_config_update_provider() {
@@ -381,7 +583,7 @@ _codex_config_update_provider() {
       if (!seen_wire) print "wire_api = \"" wire_api "\""
       if (!seen_openai_auth) print "requires_openai_auth = false"
     }
-    { header=$0; gsub(/[[:space:]]/, "", header) }
+    { header=$0; sub(/[[:space:]]*#.*/, "", header); gsub(/[[:space:]]/, "", header) }
     skipping_auth && header !~ /^\[/ { next }
     skipping_auth { skipping_auth=0 }
     header == "[" auth_section "]" {
@@ -415,19 +617,6 @@ _codex_config_update_provider() {
       print "args = [\"-er\", \".OPENAI_API_KEY | strings | select(length > 0)\", \"" credential_path "\"]"
     }
   ' "$CODEX_CONFIG" > "$output"
-}
-
-_codex_append_provider() {
-  local file="$1" provider="$2" display="$3" base_url="$4" wire_api="$5"
-  local command_path credential_path
-  command_path="$(_codex_toml_escape "$(type -P jq)")"
-  credential_path="$(_codex_toml_escape "$CODEX_AUTH_DIR/$provider.json")"
-  [[ ! -s "$file" || "$(tail -c 1 "$file" | wc -l | tr -d ' ')" != 0 ]] || printf '\n' >> "$file"
-  [[ ! -s "$file" ]] || printf '\n' >> "$file"
-  printf '[model_providers.%s]\nname = "%s"\nbase_url = "%s"\nwire_api = "%s"\nrequires_openai_auth = false\n\n' \
-    "$provider" "$(_codex_toml_escape "$display")" "$(_codex_toml_escape "$base_url")" "$wire_api" >> "$file"
-  printf '[model_providers.%s.auth]\ncommand = "%s"\nargs = ["-er", ".OPENAI_API_KEY | strings | select(length > 0)", "%s"]\n' \
-    "$provider" "$command_path" "$credential_path" >> "$file"
 }
 
 _codex_write_api_auth() {
@@ -632,7 +821,7 @@ cmd_codex_show() {
 
 cmd_codex_new() {
   _codex_prepare
-  local provider="${1:-}" display base_url wire_api key config_tmp auth_tmp
+  local provider="${1:-}" key fragment config_tmp auth_tmp
   [[ -n "$provider" ]] || die "usage: ccs codex new <provider>"
   if [[ "$provider" == "openai" ]]; then
     [[ ! -f "$CODEX_AUTH_DIR/openai.json" ]] || die "OpenAI auth is already managed; run 'ccs codex login' to sign in again"
@@ -642,13 +831,12 @@ cmd_codex_new() {
   [[ "$provider" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ && "$provider" != "openai" ]] || die "invalid Codex provider name '$provider'"
   _codex_provider_exists "$provider" && die "Codex provider '$provider' already exists"
 
-  read -r -p "Display name [$provider]: " display
-  display="${display:-$provider}"
-  read -r -p "Base URL: " base_url
-  [[ -n "$base_url" ]] || die "Base URL is required"
-  read -r -p "Wire API [responses]: " wire_api
-  wire_api="${wire_api:-responses}"
-  [[ "$wire_api" == "responses" || "$wire_api" == "chat" ]] || die "wire API must be 'responses' or 'chat'"
+  fragment="$(mktemp "$CODEX_DIR/.ccs.$provider.edit.XXXXXX")"
+  chmod 600 "$fragment"
+  _codex_register_temp "$fragment"
+  _codex_new_provider_fragment "$provider" "$fragment"
+  _codex_open_provider_fragment "$provider" "$fragment"
+  _codex_validate_provider_fragment "$provider" "$fragment"
   key="$(_codex_read_secret 'API key: ')"
   [[ -n "$key" ]] || die "API key is required"
 
@@ -657,8 +845,9 @@ cmd_codex_new() {
   [[ ! -e "$CODEX_AUTH_DIR/$provider.json" ]] || die "Codex auth snapshot '$provider' already exists"
   config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
   auth_tmp="$CODEX_AUTH_DIR/.ccs.$provider.json.tmp.$$"
-  cp "$CODEX_CONFIG" "$config_tmp"
-  _codex_append_provider "$config_tmp" "$provider" "$display" "$base_url" "$wire_api"
+  _codex_register_temp "$config_tmp"
+  _codex_register_temp "$auth_tmp"
+  _codex_merge_provider_fragment "$provider" "$fragment" "$config_tmp"
   _codex_write_api_auth "$key" "$auth_tmp"
   mv "$auth_tmp" "$CODEX_AUTH_DIR/$provider.json"
   if ! mv "$config_tmp" "$CODEX_CONFIG"; then
@@ -736,28 +925,43 @@ cmd_codex_use() {
 
 cmd_codex_edit() {
   _codex_prepare
-  local provider="${1:-}" display base_url wire_api new_key config_tmp auth_tmp auth_backup=""
+  local provider="${1:-}" new_key fragment current_fragment baseline current_fingerprint
+  local config_tmp auth_tmp auth_backup=""
   [[ -n "$provider" ]] || die "usage: ccs codex edit <provider>"
   [[ "$provider" != "openai" ]] || die "the built-in 'openai' provider cannot be edited"
   _codex_provider_exists "$provider" || die "Codex provider '$provider' not found"
-  display="$(_codex_provider_field "$provider" name)"
-  base_url="$(_codex_provider_field "$provider" base_url)"
-  wire_api="$(_codex_provider_field "$provider" wire_api)"
-  local answer
-  read -r -p "Display name [$display]: " answer; display="${answer:-$display}"
-  read -r -p "Base URL [$base_url]: " answer; base_url="${answer:-$base_url}"
-  read -r -p "Wire API [$wire_api]: " answer; wire_api="${answer:-$wire_api}"
-  [[ "$wire_api" == "responses" || "$wire_api" == "chat" ]] || die "wire API must be 'responses' or 'chat'"
+
+  fragment="$(mktemp "$CODEX_DIR/.ccs.$provider.edit.XXXXXX")"
+  current_fragment="$(mktemp "$CODEX_DIR/.ccs.$provider.current.XXXXXX")"
+  chmod 600 "$fragment" "$current_fragment"
+  _codex_register_temp "$fragment"
+  _codex_register_temp "$current_fragment"
+  _codex_extract_provider_fragment "$provider" "$CODEX_CONFIG" "$fragment"
+  baseline="$(_codex_file_fingerprint "$fragment")"
+  _codex_open_provider_fragment "$provider" "$fragment"
+  _codex_validate_provider_fragment "$provider" "$fragment"
   new_key="$(_codex_read_secret 'New API key (leave blank to keep current): ')"
-  [[ -f "$CODEX_AUTH_DIR/$provider.json" || -n "$new_key" ]] || die "API key is required because this provider has no auth snapshot"
+  if [[ -z "$new_key" ]]; then
+    _codex_validate_provider_auth "$CODEX_AUTH_DIR/$provider.json"
+  fi
 
   _codex_lock_acquire
   _codex_provider_exists "$provider" || die "Codex provider '$provider' not found"
+  _codex_extract_provider_fragment "$provider" "$CODEX_CONFIG" "$current_fragment"
+  current_fingerprint="$(_codex_file_fingerprint "$current_fragment")"
+  [[ "$current_fingerprint" == "$baseline" ]] \
+    || die "Codex provider '$provider' changed while editing; no changes were written"
+  if [[ -z "$new_key" ]]; then
+    _codex_validate_provider_auth "$CODEX_AUTH_DIR/$provider.json"
+  fi
   config_tmp="$CODEX_DIR/.ccs.config.toml.tmp.$$"
-  _codex_config_update_provider "$provider" "$display" "$base_url" "$wire_api" "$config_tmp"
+  _codex_register_temp "$config_tmp"
+  _codex_merge_provider_fragment "$provider" "$fragment" "$config_tmp"
   if [[ -n "$new_key" ]]; then
     auth_tmp="$CODEX_AUTH_DIR/.ccs.$provider.json.tmp.$$"
     auth_backup="$CODEX_AUTH_DIR/.ccs.$provider.json.backup.$$"
+    _codex_register_temp "$auth_tmp"
+    _codex_register_temp "$auth_backup"
     [[ ! -f "$CODEX_AUTH_DIR/$provider.json" ]] || cp "$CODEX_AUTH_DIR/$provider.json" "$auth_backup"
     _codex_write_api_auth "$new_key" "$auth_tmp"
     mv "$auth_tmp" "$CODEX_AUTH_DIR/$provider.json"
@@ -819,10 +1023,10 @@ Usage:
   ccs codex list              List providers and saved auth
   ccs codex current           Show the active provider
   ccs codex use <name>        Switch providers while keeping ChatGPT auth
-  ccs codex new <provider>    Create a provider interactively
+  ccs codex new <provider>    Create a provider in \$EDITOR, then enter its API key
   ccs codex new openai        Create an official ChatGPT subscription login
   ccs codex login             Sign in to OpenAI again and refresh its snapshot
-  ccs codex edit <name>       Edit provider settings and optionally its API key
+  ccs codex edit <name>       Edit provider TOML in \$EDITOR, then optionally rotate its API key
   ccs codex rm <name>         Remove an inactive provider
   ccs codex show [<name>]     Show provider metadata (secrets masked)
 

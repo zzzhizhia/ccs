@@ -4,12 +4,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CCS="$ROOT/ccs.sh"
 JQ_BIN="$(type -P jq)"
+EDITOR_FIXTURE="$ROOT/tests/fixtures/codex-provider-editor"
+EDITOR_CMD="bash $EDITOR_FIXTURE"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_file() { [[ -f "$1" ]] || fail "missing file: $1"; }
 assert_contains() { grep -qF "$2" "$1" || fail "$1 does not contain: $2"; }
 assert_not_contains() { ! grep -qF "$2" "$1" || fail "$1 unexpectedly contains: $2"; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "expected '$2', got '$1'"; }
+assert_no_ccs_temps() {
+  local leftover
+  leftover="$(
+    find "$1/.codex" "$1/.codex/ccs-auth" -maxdepth 1 -type f -name '.ccs.*' -print -quit 2>/dev/null
+  )"
+  [[ -z "$leftover" ]] || fail "temporary CCS file was not cleaned up: $leftover"
+}
 
 # Fresh file-mode workflow, including preservation of unrelated config and ChatGPT auth.
 TEST_HOME="$(mktemp -d)"
@@ -32,17 +41,26 @@ jq -n '{
 }' \
   > "$TEST_HOME/.codex/auth.json"
 chmod 600 "$TEST_HOME/.codex/auth.json"
+chatgpt_auth_hash="$(shasum -a 256 "$TEST_HOME/.codex/auth.json" | cut -d' ' -f1)"
 
 HOME="$TEST_HOME" bash "$CCS" codex list >/dev/null
+assert_eq "$(bash "$CCS" version)" "ccs 0.5.0"
 assert_file "$TEST_HOME/.codex/ccs-auth/openai.json"
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/ccs-auth/openai.json")" "refresh"
 assert_file "$TEST_HOME/.codex/ccs-auth/.migrated-v2"
 
-printf '\nhttps://proxy.example/v1\n\nproxy-key\n' \
-  | HOME="$TEST_HOME" bash "$CCS" codex new proxy >/dev/null
+printf 'proxy-key\n' \
+  | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" \
+    CCS_TEST_DISPLAY_NAME="Proxy via editor" \
+    CCS_TEST_BASE_URL="https://proxy.example/v1" \
+    CCS_TEST_RETRY_COUNT=7 \
+    bash "$CCS" codex new proxy >/dev/null
 assert_contains "$TEST_HOME/.codex/config.toml" '[model_providers.proxy]'
+assert_contains "$TEST_HOME/.codex/config.toml" 'name = "Proxy via editor"'
+assert_contains "$TEST_HOME/.codex/config.toml" 'request_max_retries = 7'
 assert_contains "$TEST_HOME/.codex/config.toml" 'requires_openai_auth = false'
 assert_not_contains "$TEST_HOME/.codex/config.toml" 'env_key ='
+assert_not_contains "$TEST_HOME/.codex/config.toml" 'proxy-key'
 assert_contains "$TEST_HOME/.codex/config.toml" '[model_providers.proxy.auth]'
 assert_contains "$TEST_HOME/.codex/config.toml" "command = \"$JQ_BIN\""
 assert_contains "$TEST_HOME/.codex/config.toml" \
@@ -68,15 +86,93 @@ HOME="$TEST_HOME" bash "$CCS" codex use openai >/dev/null
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/auth.json")" "refresh"
 assert_eq "$(HOME="$TEST_HOME" bash "$CCS" codex current)" "openai"
 
-printf '\nhttps://proxy.example/v2\n\nproxy-key-2\n' \
-  | HOME="$TEST_HOME" bash "$CCS" codex edit proxy >/dev/null
+printf '\n[model_providers.proxy.extra]\nnote = "keep-me"\n' >> "$TEST_HOME/.codex/config.toml"
+printf 'proxy-key-2\n' \
+  | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" \
+    CCS_TEST_DISPLAY_NAME="Edited Proxy" \
+    CCS_TEST_BASE_URL="https://proxy.example/v2" \
+    CCS_TEST_RETRY_COUNT=9 \
+    bash "$CCS" codex edit proxy >/dev/null
 assert_contains "$TEST_HOME/.codex/config.toml" 'base_url = "https://proxy.example/v2"'
+assert_contains "$TEST_HOME/.codex/config.toml" 'request_max_retries = 9'
+assert_contains "$TEST_HOME/.codex/config.toml" '[model_providers.proxy.extra]'
+assert_contains "$TEST_HOME/.codex/config.toml" 'note = "keep-me"'
 assert_contains "$TEST_HOME/.codex/config.toml" 'requires_openai_auth = false'
 assert_eq "$(grep -cF '[model_providers.proxy.auth]' "$TEST_HOME/.codex/config.toml")" "1"
+assert_eq "$(jq -r '.OPENAI_API_KEY' "$TEST_HOME/.codex/ccs-auth/proxy.json")" "proxy-key-2"
+printf '\n' \
+  | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" \
+    CCS_TEST_DISPLAY_NAME="Edited Proxy" \
+    CCS_TEST_BASE_URL="https://proxy.example/v3" \
+    CCS_TEST_RETRY_COUNT=10 \
+    bash "$CCS" codex edit proxy >/dev/null
+assert_contains "$TEST_HOME/.codex/config.toml" 'base_url = "https://proxy.example/v3"'
+assert_contains "$TEST_HOME/.codex/config.toml" 'request_max_retries = 10'
 assert_eq "$(jq -r '.OPENAI_API_KEY' "$TEST_HOME/.codex/ccs-auth/proxy.json")" "proxy-key-2"
 show_output="$(HOME="$TEST_HOME" bash "$CCS" codex show proxy)"
 [[ "$show_output" == *'api_key:  ***'* ]] || fail "show did not mask API key"
 [[ "$show_output" != *'proxy-key-2'* ]] || fail "show leaked API key"
+
+# Editor, fragment, key, auth, and concurrency failures leave no partial CCS writes.
+stable_config_hash="$(shasum -a 256 "$TEST_HOME/.codex/config.toml" | cut -d' ' -f1)"
+stable_provider_key="$(jq -r '.OPENAI_API_KEY' "$TEST_HOME/.codex/ccs-auth/proxy.json")"
+if HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" CCS_TEST_EDITOR_MODE=fail \
+  bash "$CCS" codex new editorfail >/dev/null 2>&1; then
+  fail "provider creation succeeded after editor failure"
+fi
+if printf 'unused-key\n' \
+  | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" CCS_TEST_WIRE_API=invalid \
+    bash "$CCS" codex new invalid >/dev/null 2>&1; then
+  fail "provider creation succeeded with an invalid fragment"
+fi
+if printf '\n' \
+  | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" \
+    CCS_TEST_BASE_URL="https://blank.example/v1" \
+    bash "$CCS" codex new blankkey >/dev/null 2>&1; then
+  fail "provider creation succeeded with a blank API key"
+fi
+assert_eq "$(shasum -a 256 "$TEST_HOME/.codex/config.toml" | cut -d' ' -f1)" "$stable_config_hash"
+[[ ! -e "$TEST_HOME/.codex/ccs-auth/editorfail.json" ]] || fail "editor failure left an auth snapshot"
+[[ ! -e "$TEST_HOME/.codex/ccs-auth/invalid.json" ]] || fail "invalid fragment left an auth snapshot"
+[[ ! -e "$TEST_HOME/.codex/ccs-auth/blankkey.json" ]] || fail "blank key left an auth snapshot"
+
+for invalid_mode in rename auth-table; do
+  if printf 'unused-key\n' \
+    | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" CCS_TEST_EDITOR_MODE="$invalid_mode" \
+      bash "$CCS" codex edit proxy >/dev/null 2>&1; then
+    fail "provider edit succeeded with invalid mode: $invalid_mode"
+  fi
+done
+if printf 'unused-key\n' \
+  | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" CCS_TEST_REQUIRES_OPENAI_AUTH=true \
+    bash "$CCS" codex edit proxy >/dev/null 2>&1; then
+  fail "provider edit accepted requires_openai_auth = true"
+fi
+assert_eq "$(shasum -a 256 "$TEST_HOME/.codex/config.toml" | cut -d' ' -f1)" "$stable_config_hash"
+assert_eq "$(jq -r '.OPENAI_API_KEY' "$TEST_HOME/.codex/ccs-auth/proxy.json")" "$stable_provider_key"
+
+mv "$TEST_HOME/.codex/ccs-auth/proxy.json" "$TEST_HOME/.codex/ccs-auth/proxy.saved"
+if printf '\n' \
+  | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" \
+    CCS_TEST_BASE_URL="https://missing-auth.example/v1" \
+    bash "$CCS" codex edit proxy >/dev/null 2>&1; then
+  fail "provider edit kept a missing auth snapshot"
+fi
+mv "$TEST_HOME/.codex/ccs-auth/proxy.saved" "$TEST_HOME/.codex/ccs-auth/proxy.json"
+assert_eq "$(shasum -a 256 "$TEST_HOME/.codex/config.toml" | cut -d' ' -f1)" "$stable_config_hash"
+
+if printf 'race-key\n' \
+  | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" CCS_TEST_EDITOR_MODE=concurrent \
+    CCS_TEST_BASE_URL="https://editor-race.example/v1" \
+    CCS_TEST_CONCURRENT_URL="https://concurrent.example/v1" \
+    bash "$CCS" codex edit proxy >/dev/null 2>&1; then
+  fail "provider edit overwrote a concurrent provider change"
+fi
+assert_contains "$TEST_HOME/.codex/config.toml" 'base_url = "https://concurrent.example/v1"'
+assert_not_contains "$TEST_HOME/.codex/config.toml" 'base_url = "https://editor-race.example/v1"'
+assert_eq "$(jq -r '.OPENAI_API_KEY' "$TEST_HOME/.codex/ccs-auth/proxy.json")" "$stable_provider_key"
+assert_no_ccs_temps "$TEST_HOME"
+assert_eq "$(shasum -a 256 "$TEST_HOME/.codex/auth.json" | cut -d' ' -f1)" "$chatgpt_auth_hash"
 
 # Duplicate creation, removed commands, corrupt snapshots, and lock contention fail safely.
 if HOME="$TEST_HOME" bash "$CCS" codex new proxy >/dev/null 2>&1; then
@@ -193,8 +289,11 @@ assert_eq "$(stat -f '%Lp' "$NEW_USER_HOME/.codex/ccs-auth/openai.json")" "600"
 if HOME="$NEW_USER_HOME" PATH="$FAKE_BIN:$PATH" bash "$CCS" codex new openai >/dev/null 2>&1; then
   fail "duplicate OpenAI subscription creation succeeded"
 fi
-printf '\nhttps://proxy.example/v1\n\nnew-user-proxy-key\n' \
-  | HOME="$NEW_USER_HOME" PATH="$FAKE_BIN:$PATH" bash "$CCS" codex new proxy >/dev/null
+printf 'new-user-proxy-key\n' \
+  | HOME="$NEW_USER_HOME" PATH="$FAKE_BIN:$PATH" EDITOR="$EDITOR_CMD" \
+    CCS_TEST_DISPLAY_NAME="New User Proxy" \
+    CCS_TEST_BASE_URL="https://new-user-proxy.example/v1" \
+    bash "$CCS" codex new proxy >/dev/null
 HOME="$NEW_USER_HOME" PATH="$FAKE_BIN:$PATH" bash "$CCS" codex use proxy >/dev/null
 HOME="$NEW_USER_HOME" PATH="$FAKE_BIN:$PATH" bash "$CCS" codex login >/dev/null
 assert_eq "$(jq -r '.tokens.account_id' "$NEW_USER_HOME/.codex/ccs-auth/openai.json")" "native-account"

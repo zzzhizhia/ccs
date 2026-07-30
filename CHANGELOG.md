@@ -2,6 +2,15 @@
 
 All notable changes to CCS are documented in this file.
 
+## [0.6.1] - 2026-07-30
+
+### Fixed
+
+- Fixed fixed-provider migration being blocked by an unrelated inactive legacy
+  provider with an incomplete definition or no saved credential. Inactive
+  providers are now preserved for later repair, while the active provider and
+  every subsequent switch remain strictly validated.
+
 ## [0.6.0] - 2026-07-30
 
 ### Added
@@ -27,4 +36,5 @@ All notable changes to CCS are documented in this file.
   byte-preserving switches, migration conflicts, lock contention, interrupted
   commits, credential preservation, and active/inactive rename behavior.
 
+[0.6.1]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.1
 [0.6.0]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.0

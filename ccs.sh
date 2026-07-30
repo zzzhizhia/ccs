@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.6.1"
 REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -1128,10 +1128,12 @@ _codex_migrate_fixed_locked() {
     for provider in "${providers[@]}"; do
       [[ "$provider" != "ccs" && "$provider" != "openai" ]] \
         || die "cannot migrate reserved logical provider '$provider'"
-      _codex_validate_provider_auth "$CODEX_AUTH_DIR/$provider.json"
       profile="$stage/$provider.toml"
       _codex_extract_provider_fragment "$provider" "$CODEX_CONFIG" "$profile"
-      _codex_validate_provider_fragment "$provider" "$profile"
+      if [[ "$provider" == "$active" ]]; then
+        _codex_validate_provider_auth "$CODEX_AUTH_DIR/$provider.json"
+        _codex_validate_provider_fragment "$provider" "$profile"
+      fi
       chmod 600 "$profile"
     done
   fi

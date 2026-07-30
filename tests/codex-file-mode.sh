@@ -76,7 +76,7 @@ chmod 600 "$TEST_HOME/.codex/auth.json"
 chatgpt_auth_hash="$(shasum -a 256 "$TEST_HOME/.codex/auth.json" | cut -d' ' -f1)"
 
 HOME="$TEST_HOME" bash "$CCS" codex list >/dev/null
-assert_eq "$(bash "$CCS" version)" "ccs 0.6.0"
+assert_eq "$(bash "$CCS" version)" "ccs 0.6.1"
 assert_file "$TEST_HOME/.codex/ccs-auth/openai.json"
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/ccs-auth/openai.json")" "refresh"
 assert_file "$TEST_HOME/.codex/ccs-auth/.migrated-v2"
@@ -442,6 +442,40 @@ assert_not_contains "$NESTED_HOME/.codex/ccs-providers/other.toml" '[model_provi
 assert_eq "$(shasum -a 256 "$NESTED_HOME/.codex/auth.json" | cut -d' ' -f1)" "$nested_auth_hash"
 assert_eq "$(shasum -a 256 "$NESTED_HOME/.codex/ccs-auth/proxy.json" | cut -d' ' -f1)" "$nested_proxy_hash"
 assert_eq "$(shasum -a 256 "$NESTED_HOME/.codex/ccs-auth/other.json" | cut -d' ' -f1)" "$nested_other_hash"
+
+# An unusable inactive legacy provider is preserved without blocking the valid active provider.
+STALE_HOME="$(mktemp -d)"
+mkdir -p "$STALE_HOME/.codex/ccs-auth"
+printf '%s\n' \
+  'model_provider = "aicodemirror"' \
+  'model = "gpt-stale"' \
+  '' \
+  '[model_providers.of]' \
+  'name = "of"' \
+  '' \
+  '[model_providers.aicodemirror]' \
+  'name = "aicodemirror"' \
+  'base_url = "https://api.aicodemirror.example/v1"' \
+  'wire_api = "responses"' \
+  'requires_openai_auth = false' > "$STALE_HOME/.codex/config.toml"
+jq -n '{auth_mode:"chatgpt",tokens:{refresh_token:"stale-refresh"}}' > "$STALE_HOME/.codex/auth.json"
+cp "$STALE_HOME/.codex/auth.json" "$STALE_HOME/.codex/ccs-auth/openai.json"
+jq -n --arg key 'stale-active-key' '{auth_mode:"apikey",OPENAI_API_KEY:$key}' \
+  > "$STALE_HOME/.codex/ccs-auth/aicodemirror.json"
+: > "$STALE_HOME/.codex/ccs-auth/.migrated-v2"
+chmod 600 "$STALE_HOME/.codex/auth.json" "$STALE_HOME/.codex/ccs-auth/"*
+stale_auth_hash="$(shasum -a 256 "$STALE_HOME/.codex/auth.json" | cut -d' ' -f1)"
+assert_eq "$(HOME="$STALE_HOME" bash "$CCS" codex current 2>/dev/null)" "aicodemirror"
+assert_contains "$STALE_HOME/.codex/config.toml" 'model_provider = "ccs"'
+assert_contains "$STALE_HOME/.codex/ccs-providers/of.toml" '[model_providers.of]'
+assert_contains "$STALE_HOME/.codex/ccs-providers/aicodemirror.toml" '[model_providers.aicodemirror]'
+stale_config_hash="$(shasum -a 256 "$STALE_HOME/.codex/config.toml" | cut -d' ' -f1)"
+if HOME="$STALE_HOME" bash "$CCS" codex use of >/dev/null 2>&1; then
+  fail "unusable inactive provider became switchable after migration"
+fi
+assert_eq "$(HOME="$STALE_HOME" bash "$CCS" codex current)" "aicodemirror"
+assert_eq "$(shasum -a 256 "$STALE_HOME/.codex/config.toml" | cut -d' ' -f1)" "$stale_config_hash"
+assert_eq "$(shasum -a 256 "$STALE_HOME/.codex/auth.json" | cut -d' ' -f1)" "$stale_auth_hash"
 
 # Migration conflicts and malformed/missing inputs fail before any partial fixed-provider state appears.
 for failure_mode in fixed-conflict bad-toml missing-auth; do

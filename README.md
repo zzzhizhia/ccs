@@ -163,15 +163,17 @@ ccs codex show proxy
 ccs codex use openai
 ```
 
-On the first v0.6 command, CCS validates every legacy provider table and saved
-credential before writing anything. It saves each table as a logical profile,
-materializes the formerly active profile under the fixed `ccs` ID, removes the
-legacy provider tables, and creates the `current` link. A mode-600 config backup
-under `~/.codex/ccs-backups/` is retained and never modified by CCS. A fixed-ID
-conflict, malformed provider TOML, missing credential, lock conflict, or
-interruption leaves config, current, and credentials uncommitted or restored.
-Older `.env` profiles are still imported before this migration, and their
-timestamped read-only backup is retained.
+On the first v0.6 command, CCS validates the legacy config structure and the
+formerly active profile before writing anything. It saves every table as a
+logical profile, including inactive profiles that do not yet have usable
+credentials, then materializes the active profile under the fixed `ccs` ID and
+creates the `current` link. Switching to a preserved inactive profile still
+performs the normal strict fragment and credential validation. A mode-600 config
+backup under `~/.codex/ccs-backups/` is retained and never modified by CCS. A
+fixed-ID conflict, malformed provider TOML, unusable active profile, lock
+conflict, or interruption leaves config, current, and credentials uncommitted
+or restored. Older `.env` profiles are still imported before this migration,
+and their timestamped read-only backup is retained.
 
 Codex files:
 

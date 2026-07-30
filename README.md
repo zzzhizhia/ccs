@@ -23,6 +23,7 @@ Supports **zsh**, **bash**, and **fish** — detected automatically.
 ```
 ccs new work          Create a profile, opens $EDITOR
 ccs edit work         Edit an existing profile
+ccs rename work team  Rename a profile and its statusline binding
 ccs list              List all profiles (* = active)
 ccs use deepseek      Switch profile (current terminal + persist)
 ccs env minimax       Source a profile in current terminal only
@@ -39,11 +40,12 @@ ccs codex new openai  Create an official ChatGPT subscription login
 ccs codex login       Sign in to OpenAI again and refresh its snapshot
 ccs codex use proxy   Switch providers while keeping ChatGPT signed in
 ccs codex edit proxy  Edit provider TOML, then optionally rotate its API key
+ccs codex rename proxy gateway  Rename a provider and its saved auth
 ccs codex list        List providers and saved credentials
 ccs codex show proxy  Show provider metadata with secrets masked
 ```
 
-Short aliases: `ls`, `c`, `sw`, `e`, `rm`, `source`, `src`, `off`.
+Short aliases: `ls`, `c`, `sw`, `e`, `ren`, `rm`, `source`, `src`, `off`.
 
 ## Statusline
 
@@ -98,27 +100,47 @@ New terminals auto-restore the last `ccs use` profile via a symlink at
 
 ## Codex providers
 
-Codex provider switching does not use shell environment variables. `ccs codex
-new <provider>` opens a temporary TOML fragment in `${EDITOR:-vim}` with the
-provider name, an empty `base_url`, `wire_api = "responses"`, and
-`requires_openai_auth = false`. After the editor exits, CCS validates the
-fragment and prompts for the API key separately with hidden terminal input.
-Only then does it atomically merge the provider into `~/.codex/config.toml`
-and store the key in a protected snapshot under `~/.codex/ccs-auth/`.
+Codex provider switching does not use shell environment variables. The names
+used by `ccs codex` (`openai`, `proxy`, and so on) are **logical provider
+profiles**. Codex itself always sees the fixed ID `ccs`: `config.toml` contains
+exactly one `model_provider = "ccs"` line and one `[model_providers.ccs]` main
+table. Switching profiles replaces that fixed table and its nested tables, so
+Codex App conversation visibility does not change with the upstream service.
 
-`ccs codex edit <provider>` opens only that provider's TOML tables, not the
-complete Codex config. Other providers and top-level settings are preserved.
-After editing, enter a new API key to rotate it or leave the prompt blank to
-keep the saved key. Provider names cannot be changed in the editor; remove and
-recreate a provider to rename it. The command-backed `.auth` table is managed
-by CCS and is regenerated after every successful edit.
+`ccs codex new <provider>` opens a temporary logical TOML fragment in
+`${EDITOR:-vim}` with an empty `base_url`, `wire_api = "responses"`, and
+`requires_openai_auth = false`. After validation, CCS prompts separately for
+the API key with hidden terminal input. The logical fragment is stored at
+`~/.codex/ccs-providers/<provider>.toml`; the key is stored independently at
+`~/.codex/ccs-auth/<provider>.json`. Neither secret is printed or embedded in
+the TOML fragment.
 
-`ccs codex use <provider>` updates only the top-level `model_provider`.
-`~/.codex/auth.json` remains the official ChatGPT login so Codex Remote can
-continue authenticating the desktop host. Model requests use the selected
-provider's independent key through Codex's command-backed bearer-token support.
-Third-party providers default to `requires_openai_auth = false`, so ChatGPT
-OAuth tokens are never sent to their endpoints.
+`ccs codex use <provider>` validates the logical fragment and its credential,
+then atomically updates the fixed table and the `ccs-providers/current`
+symlink while holding the CCS lock. Other top-level settings and sections are
+preserved byte-for-byte. `current`, `list`, and `show` continue to report the
+logical profile name. `~/.codex/auth.json` remains the global ChatGPT login and
+is not rewritten during provider switching.
+
+`ccs codex edit <provider>` edits only the logical fragment. Enter a new API
+key to rotate its protected snapshot or leave the prompt blank to keep it. If
+the edited profile is active, CCS refreshes `[model_providers.ccs]` in the same
+transaction. Provider names cannot be changed in the editor; use `ccs codex
+rename <old> <new>`.
+
+`ccs codex rename <old> <new>` renames the logical main and nested tables,
+moves its auth snapshot, and updates `current` plus the fixed table when the
+profile is active. `ccs codex rm <name>` removes only an inactive logical
+profile and its snapshot. Neither command renames or removes the fixed `ccs`
+provider ID. The names `ccs` and `openai` are reserved; built-in `openai`
+cannot be edited, renamed, or removed.
+
+Third-party profiles materialize a managed `[model_providers.ccs.auth]` table
+that reads their own `ccs-auth/<provider>.json`; they use
+`requires_openai_auth = false`, so ChatGPT OAuth tokens are not sent to their
+endpoints. The logical `openai` profile instead materializes the ChatGPT Codex
+endpoint with `wire_api = "responses"` and `requires_openai_auth = true`, with
+no third-party `.auth` table.
 
 For a new machine, create the official subscription credential through Codex's
 native browser login. CCS never handles the password or OAuth exchange itself;
@@ -129,7 +151,9 @@ ccs codex new openai
 ```
 
 Use `ccs codex login` later to sign in again or refresh the managed OpenAI
-credential.
+credential. Native login runs with a process-only `model_provider="openai"`
+override. After it exits, the on-disk config is immediately materialized back
+to the fixed `ccs` ID and the logical `openai` profile becomes active.
 
 ```bash
 ccs codex new proxy
@@ -139,16 +163,24 @@ ccs codex show proxy
 ccs codex use openai
 ```
 
-On the first v0.4 command, v0.3 providers are converted to independent command
-auth and the saved ChatGPT login is restored as global Codex auth. Older Codex
-`.env` profiles are also migrated automatically, with the old profile directory
-retained as a timestamped read-only backup.
+On the first v0.6 command, CCS validates every legacy provider table and saved
+credential before writing anything. It saves each table as a logical profile,
+materializes the formerly active profile under the fixed `ccs` ID, removes the
+legacy provider tables, and creates the `current` link. A mode-600 config backup
+under `~/.codex/ccs-backups/` is retained and never modified by CCS. A fixed-ID
+conflict, malformed provider TOML, missing credential, lock conflict, or
+interruption leaves config, current, and credentials uncommitted or restored.
+Older `.env` profiles are still imported before this migration, and their
+timestamped read-only backup is retained.
 
 Codex files:
 
 | Path | Purpose |
 |------|---------|
-| `~/.codex/config.toml` | Provider definitions and active `model_provider` |
+| `~/.codex/config.toml` | Fixed `model_provider = "ccs"` and the active `[model_providers.ccs]` table |
 | `~/.codex/auth.json` | Official ChatGPT login used by Codex and Remote |
+| `~/.codex/ccs-providers/<provider>.toml` | Logical provider definition and nested tables |
+| `~/.codex/ccs-providers/current` | Symlink to the active logical provider profile |
 | `~/.codex/ccs-auth/openai.json` | Protected backup of the complete ChatGPT login |
 | `~/.codex/ccs-auth/<provider>.json` | Protected third-party key read through command auth |
+| `~/.codex/ccs-backups/` | Protected pre-migration config backups |

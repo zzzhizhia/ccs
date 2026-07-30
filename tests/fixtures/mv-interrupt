@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${!#}"
+if [[ "$target" == "$HOME/.codex/ccs-providers" ]]; then
+  kill -TERM "$PPID"
+  exit 143
+fi
+
+exec /bin/mv "$@"

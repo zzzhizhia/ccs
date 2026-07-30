@@ -84,7 +84,7 @@ if [[ "$mode" == "auth-table" ]]; then
 fi
 
 if [[ "$mode" == "concurrent" ]]; then
-  config="$HOME/.codex/config.toml"
+  config="$HOME/.codex/ccs-providers/$provider.toml"
   concurrent_url="${CCS_TEST_CONCURRENT_URL:-https://concurrent.example/v1}"
   awk -v section="model_providers.$provider" -v base_url="$concurrent_url" '
     {

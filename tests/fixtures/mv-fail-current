@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${!#}"
+if [[ "$target" == "$HOME/.codex/ccs-providers/current" ]]; then
+  exit 74
+fi
+
+exec /bin/mv "$@"

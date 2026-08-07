@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.1"
+VERSION="0.6.2"
 REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"

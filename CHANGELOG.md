@@ -2,6 +2,15 @@
 
 All notable changes to CCS are documented in this file.
 
+## [0.6.2] - 2026-08-07
+
+### Fixed
+
+- Skip rewriting the active statusline script when its generated content and
+  executable state are unchanged during shell startup.
+- Ignore statusline materialization filesystem failures during initialization so
+  restoring the active profile environment can continue.
+
 ## [0.6.1] - 2026-07-30
 
 ### Fixed
@@ -36,5 +45,6 @@ All notable changes to CCS are documented in this file.
   byte-preserving switches, migration conflicts, lock contention, interrupted
   commits, credential preservation, and active/inactive rename behavior.
 
+[0.6.2]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.2
 [0.6.1]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.1
 [0.6.0]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.0

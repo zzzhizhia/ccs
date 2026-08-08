@@ -1,5 +1,4 @@
 # Blocked
 
-- 真实安装及 `ccs codex use aicodemirror` 重试未执行：任务硬性禁止写真实 `~/.codex` 或实际切换账户；当前已安装版本仍为 0.6.0。
-- fish 验收未执行：本机未安装 fish，按任务要求不编造结果。
+- fish 真实解释器验收未执行：本机未安装 fish；已验证生成的 `set -e` 语句与 wrapper 传参，未声称真机通过。
 - 其余无。

@@ -2,6 +2,24 @@
 
 All notable changes to CCS are documented in this file.
 
+## [0.6.3] - 2026-08-08
+
+### Changed
+
+- Removed redundant `base_url` and `wire_api` fields from the official Codex
+  subscription profile while retaining the fixed `ccs` provider identity,
+  OpenAI display identity, and `requires_openai_auth = true` semantics.
+- Added an idempotent, transaction-protected migration with mode-400 backups
+  for existing official Codex profiles and active configs.
+- Strengthened `ccs unset` to clear every CCS-managed variable plus variables
+  declared by the active Claude profile, including sparse and dangling states.
+- Added native fish variable-erasure output for shell-evaluated CCS commands.
+
+### Validation
+
+- Added migration idempotence and rollback coverage, official Codex minimal
+  config assertions, and Claude official subscription mode tests.
+
 ## [0.6.2] - 2026-08-07
 
 ### Fixed
@@ -45,6 +63,7 @@ All notable changes to CCS are documented in this file.
   byte-preserving switches, migration conflicts, lock contention, interrupted
   commits, credential preservation, and active/inactive rename behavior.
 
+[0.6.3]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.3
 [0.6.2]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.2
 [0.6.1]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.1
 [0.6.0]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.0

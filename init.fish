@@ -4,7 +4,7 @@ fish_add_path "$_CCS_HOME"
 function ccs
   switch "$argv[1]"
     case use sw switch env source src unset off
-      eval (command ccs.sh $argv)
+      eval (env CCS_SHELL=fish command ccs.sh $argv)
     case '*'
       command ccs.sh $argv
   end

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${!#}"
+if [[ "$1" == *'/.ccs.config.openai-defaults.'* \
+  && "$target" == "$HOME/.codex/config.toml" ]]; then
+  exit 75
+fi
+
+exec /bin/mv "$@"

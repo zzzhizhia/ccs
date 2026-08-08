@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.2"
+VERSION="0.6.3"
 REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -27,6 +27,7 @@ CODEX_BACKUP_DIR="$CODEX_DIR/ccs-backups"
 CODEX_LOCK="$CODEX_DIR/.ccs.lock"
 CODEX_MIGRATION_MARKER="$CODEX_AUTH_DIR/.migrated-v2"
 CODEX_FIXED_MIGRATION_MARKER="$CODEX_PROVIDER_DIR/.migrated-v3"
+CODEX_OPENAI_DEFAULTS_MIGRATION_MARKER="$CODEX_PROVIDER_DIR/.migrated-v4"
 CODEX_LOCK_HELD=0
 CODEX_TEMP_FILES=()
 CODEX_TEMP_DIRS=()
@@ -119,6 +120,22 @@ _clear_statusline() {
 
 # ── commands that output shell code (eval'd by wrapper) ──────────────
 
+_emit_unset() {
+  (($# > 0)) || return 0
+  local name
+  if [[ "${CCS_SHELL:-}" == "fish" ]]; then
+    for name in "$@"; do
+      printf 'set -e %s\n' "$name"
+    done
+  else
+    printf 'unset'
+    for name in "$@"; do
+      printf ' %s' "$name"
+    done
+    printf '\n'
+  fi
+}
+
 cmd_use() {
   local name="${1:-}"; [[ -z "$name" ]] && die "usage: ccs use <profile>"
   local profile="$CCS_DIR/$name.env"
@@ -129,9 +146,12 @@ cmd_use() {
     local old_profile
     old_profile="$(readlink "$CURRENT")"
     if [[ -f "$old_profile" ]]; then
-      local old_vars
-      old_vars="$(_profile_vars "$old_profile" | tr '\n' ' ')"
-      [[ -n "${old_vars// }" ]] && echo "unset ${old_vars% }"
+      local old_var
+      local old_vars=()
+      while IFS= read -r old_var; do
+        [[ -z "$old_var" ]] || old_vars+=("$old_var")
+      done < <(_profile_vars "$old_profile")
+      ((${#old_vars[@]} == 0)) || _emit_unset "${old_vars[@]}"
     else
       rm -f "$CURRENT"
     fi
@@ -161,21 +181,30 @@ cmd_source() {
 }
 
 cmd_unset() {
+  local profile="" name="" count entry var
+  local vars=()
   if [[ -L "$CURRENT" ]]; then
-    local vars
-    vars="$(_profile_vars "$(readlink "$CURRENT")" | tr '\n' ' ')"
-    if [[ -n "${vars// }" ]]; then
-      local name count
-      name="$(basename "$(readlink "$CURRENT")" .env)"
-      count="$(echo "$vars" | wc -w | tr -d ' ')"
-      echo "unset ${vars% }"
-      echo "✓ ccs: unset $count env vars from '$name'" >&2
-    else
-      echo "✓ ccs: no export vars found in profile" >&2
-    fi
+    profile="$(readlink "$CURRENT")"
+    name="$(basename "$profile" .env)"
     rm -f "$CURRENT"
+  fi
+
+  while IFS= read -r var; do
+    [[ -z "$var" ]] || vars+=("$var")
+  done < <({
+      for entry in "${CCS_VARS[@]}"; do
+        printf '%s\n' "${entry%%=*}"
+      done
+      if [[ -n "$profile" && -f "$profile" ]]; then
+        _profile_vars "$profile"
+      fi
+    } | awk 'NF && !seen[$0]++')
+  count="${#vars[@]}"
+  ((count == 0)) || _emit_unset "${vars[@]}"
+  if [[ -n "$name" ]]; then
+    echo "✓ ccs: unset $count managed env vars from '$name'; official Claude mode is active" >&2
   else
-    echo "✓ ccs: no active profile to unset" >&2
+    echo "✓ ccs: unset $count managed env vars; official Claude mode is active" >&2
   fi
   _clear_statusline
 }
@@ -807,8 +836,6 @@ _codex_write_openai_profile() {
   cat > "$output" <<'EOF'
 [model_providers.openai]
 name = "OpenAI"
-base_url = "https://chatgpt.com/backend-api/codex"
-wire_api = "responses"
 requires_openai_auth = true
 EOF
   chmod 600 "$output"
@@ -1167,13 +1194,76 @@ _codex_migrate_fixed_locked() {
   echo "  protected backup: $backup_config" >&2
 }
 
+_codex_migrate_openai_defaults_locked() {
+  [[ -f "$CODEX_OPENAI_DEFAULTS_MIGRATION_MARKER" ]] && return 0
+  [[ -f "$CODEX_FIXED_MIGRATION_MARKER" ]] \
+    || die "cannot migrate OpenAI defaults before fixed-provider migration"
+
+  local current profile profile_tmp marker_tmp config_tmp="" needs_cleanup=0
+  local stamp backup_dir
+  current="$(_codex_current_raw)"
+  profile="$(_codex_provider_path openai)"
+  [[ -f "$profile" ]] || die "built-in OpenAI logical provider is missing"
+  grep -qF '[model_providers.openai]' "$profile" \
+    || die "invalid built-in OpenAI logical provider"
+  grep -qE '^[[:space:]]*requires_openai_auth[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$profile" \
+    || die "built-in OpenAI logical provider must require OpenAI auth"
+
+  if grep -qE '^[[:space:]]*(base_url|wire_api)[[:space:]]*=' "$profile"; then
+    needs_cleanup=1
+  elif [[ "$current" == "openai" ]] \
+    && grep -qE '^[[:space:]]*(base_url|wire_api)[[:space:]]*=' "$CODEX_CONFIG"; then
+    needs_cleanup=1
+  fi
+
+  marker_tmp="$(mktemp "$CODEX_PROVIDER_DIR/.ccs.migrated-v4.XXXXXX")"
+  _codex_register_temp "$marker_tmp"
+  chmod 600 "$marker_tmp"
+  if ((needs_cleanup == 0)); then
+    mv "$marker_tmp" "$CODEX_OPENAI_DEFAULTS_MIGRATION_MARKER"
+    return 0
+  fi
+
+  profile_tmp="$(mktemp "$CODEX_PROVIDER_DIR/.ccs.openai-defaults.XXXXXX")"
+  _codex_register_temp "$profile_tmp"
+  _codex_write_openai_profile "$profile_tmp"
+  if [[ "$current" == "openai" ]]; then
+    config_tmp="$(mktemp "$CODEX_DIR/.ccs.config.openai-defaults.XXXXXX")"
+    _codex_register_temp "$config_tmp"
+    _codex_materialize_profile openai "$profile_tmp" "$CODEX_CONFIG" "$config_tmp"
+  fi
+
+  stamp="$(date +%Y%m%d%H%M%S)-$$"
+  backup_dir="$CODEX_BACKUP_DIR/openai-defaults-$stamp"
+  mkdir -p "$backup_dir"
+  chmod 700 "$CODEX_BACKUP_DIR" "$backup_dir"
+  cp "$CODEX_CONFIG" "$backup_dir/config.toml"
+  cp "$profile" "$backup_dir/openai.toml"
+  chmod 400 "$backup_dir/config.toml" "$backup_dir/openai.toml"
+  chmod 500 "$backup_dir"
+
+  _codex_transaction_begin
+  _codex_transaction_track "$profile"
+  _codex_transaction_track "$CODEX_OPENAI_DEFAULTS_MIGRATION_MARKER"
+  [[ -z "$config_tmp" ]] || _codex_transaction_track "$CODEX_CONFIG"
+  mv "$profile_tmp" "$profile"
+  [[ -z "$config_tmp" ]] || mv "$config_tmp" "$CODEX_CONFIG"
+  mv "$marker_tmp" "$CODEX_OPENAI_DEFAULTS_MIGRATION_MARKER"
+  _codex_transaction_commit
+  echo "✓ ccs: removed redundant OpenAI endpoint and wire API settings" >&2
+  echo "  read-only backup: $backup_dir" >&2
+}
+
 _codex_prepare() {
   _codex_require_jq
   _codex_init_dirs
-  if [[ ! -f "$CODEX_MIGRATION_MARKER" || ! -f "$CODEX_FIXED_MIGRATION_MARKER" ]]; then
+  if [[ ! -f "$CODEX_MIGRATION_MARKER" \
+    || ! -f "$CODEX_FIXED_MIGRATION_MARKER" \
+    || ! -f "$CODEX_OPENAI_DEFAULTS_MIGRATION_MARKER" ]]; then
     _codex_lock_acquire
     [[ -f "$CODEX_MIGRATION_MARKER" ]] || _codex_migrate_locked
     [[ -f "$CODEX_FIXED_MIGRATION_MARKER" ]] || _codex_migrate_fixed_locked
+    [[ -f "$CODEX_OPENAI_DEFAULTS_MIGRATION_MARKER" ]] || _codex_migrate_openai_defaults_locked
     _codex_lock_release
   fi
 }
@@ -1568,7 +1658,7 @@ Usage:
   ccs statusline bind <name>   Bind a statusline to a profile
   ccs statusline unbind <name> Remove a statusline binding
   ccs statusline show <name>   Show a profile's statusline
-  ccs unset             Clear all Claude Code env vars
+  ccs unset             Clear CCS env vars and use the official Claude login
   ccs update            Update ccs to latest version
   ccs path              Print profiles directory
   ccs version           Print version

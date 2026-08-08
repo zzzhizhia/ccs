@@ -1,10 +1,11 @@
 # Progress
-- 目标：Codex App 始终使用固定 `model_provider = "ccs"`，逻辑配置档可独立切换、迁移和改名。
-- 1. 已核对基线、既有 rename/0.6.0 改动与临时 HOME 回归。
-- 2. 已先加入固定 provider、字节保持、current 与凭据哈希断言，并保留红转绿证据。
-- 3. 已完成逻辑档存储、原子切换、登录、rename/rm 与一次性迁移。
-- 4. 已覆盖 built-in OpenAI、第三方、多嵌套表、冲突、锁竞争与中断回滚。
-- 5. 已修复非活动坏档错误阻断有效活动档迁移的问题并发布 0.6.1。
-- 6. 三个 Bash 测试、语法、`git diff --check` 全绿；护栏计数 186。
-- 7. 初始化状态栏同步改为内容不变时跳过、变化时原子替换；写入失败在 shell 启动期间静默处理，并新增 Bash/zsh 回归测试。
-- 最大风险：旧配置形态多样；以迁移前 600 备份、锁内暂存和严格活动档校验控制。
+- 目标：精简 Codex 与 Claude Code 官方订阅模式，同时保留固定 `model_provider = "ccs"` 和完整第一方认证语义。
+- 1. 已将版本更新为 0.6.3，官方 OpenAI logical profile 仅保留 `name = "OpenAI"` 与 `requires_openai_auth = true`。
+- 2. 已加入 `.migrated-v4` 幂等迁移，在锁内通过事务更新 logical profile 与活动配置，并保留 mode-400 迁移前备份。
+- 3. 已强化 `ccs unset`，清除 CCS 管理变量与活动 profile 声明变量的去重并集；第三方 profile、Claude OAuth 与 settings 保持不变。
+- 4. 已为 fish wrapper 增加原生 `set -e` 输出路径；本机缺少 fish，因此只完成生成结果与脚本静态验证。
+- 5. 五组隔离测试、Bash 语法、ShellCheck 定向检查和 `git diff --check` 全绿。
+- 6. 已将真实安装更新到 0.6.3，并迁移当前 OpenAI 配置。迁移前四个 provider 字段已精简为两个，非 provider 配置哈希一致，连续运行保持幂等。
+- 7. 真实 `codex login status` 保持 ChatGPT 登录，App Server 返回 `requiresOpenaiAuth: true`、`accountType: chatgpt`、`planType: plus`。
+- 8. Claude 当前 `ds` profile 名称与文件哈希保持不变，`claude auth status` 仍为第一方 OAuth。
+- 最大风险：fish 未在真实解释器中验收；其余迁移风险由只读备份、锁、事务和失败回滚测试覆盖。

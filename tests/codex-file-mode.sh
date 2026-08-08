@@ -33,6 +33,13 @@ assert_fixed_provider_state() {
   assert_eq "$(grep -cF '[model_providers.ccs]' "$config")" "1"
   assert_not_contains "$config" '[model_providers.proxy]'
   assert_not_contains "$config" '[model_providers.openai]'
+  if [[ "$logical" == "openai" ]]; then
+    assert_contains "$config" 'name = "OpenAI"'
+    assert_contains "$config" 'requires_openai_auth = true'
+    assert_not_contains "$config" 'base_url ='
+    assert_not_contains "$config" 'wire_api ='
+    assert_not_contains "$config" '[model_providers.ccs.auth]'
+  fi
   assert_eq "$(config_without_provider_hash "$config")" "$non_provider_hash"
   assert_eq "$(shasum -a 256 "$home/.codex/auth.json" | cut -d' ' -f1)" "$auth_hash"
   current="$(HOME="$home" bash "$CCS" codex current)"
@@ -45,9 +52,11 @@ assert_fixed_provider_state() {
     || fail "show did not report logical provider '$logical'"
 }
 assert_no_ccs_temps() {
-  local leftover
+  local leftover roots
+  roots=("$1/.codex" "$1/.codex/ccs-auth")
+  [[ ! -d "$1/.codex/ccs-providers" ]] || roots+=("$1/.codex/ccs-providers")
   leftover="$(
-    find "$1/.codex" "$1/.codex/ccs-auth" -maxdepth 1 -type f -name '.ccs.*' -print -quit 2>/dev/null
+    find "${roots[@]}" -maxdepth 1 -type f -name '.ccs.*' -print -quit 2>/dev/null
   )"
   [[ -z "$leftover" ]] || fail "temporary CCS file was not cleaned up: $leftover"
 }
@@ -76,10 +85,11 @@ chmod 600 "$TEST_HOME/.codex/auth.json"
 chatgpt_auth_hash="$(shasum -a 256 "$TEST_HOME/.codex/auth.json" | cut -d' ' -f1)"
 
 HOME="$TEST_HOME" bash "$CCS" codex list >/dev/null
-assert_eq "$(bash "$CCS" version)" "ccs 0.6.2"
+assert_eq "$(bash "$CCS" version)" "ccs 0.6.3"
 assert_file "$TEST_HOME/.codex/ccs-auth/openai.json"
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/ccs-auth/openai.json")" "refresh"
 assert_file "$TEST_HOME/.codex/ccs-auth/.migrated-v2"
+assert_file "$TEST_HOME/.codex/ccs-providers/.migrated-v4"
 
 printf 'proxy-key\n' \
   | HOME="$TEST_HOME" EDITOR="$EDITOR_CMD" \
@@ -127,6 +137,8 @@ HOME="$TEST_HOME" bash "$CCS" codex use openai >/dev/null
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/auth.json")" "refresh"
 assert_eq "$(HOME="$TEST_HOME" bash "$CCS" codex current)" "openai"
 assert_not_contains "$TEST_HOME/.codex/config.toml" '[model_providers.ccs.auth]'
+assert_not_contains "$TEST_HOME/.codex/config.toml" 'base_url ='
+assert_not_contains "$TEST_HOME/.codex/config.toml" 'wire_api ='
 
 printf '\n[model_providers.proxy.extra]\nnote = "keep-me"\n' >> "$proxy_profile"
 printf 'proxy-key-2\n' \
@@ -317,6 +329,7 @@ assert_eq "$("$JQ_BIN" -er '.OPENAI_API_KEY | strings | select(length > 0)' "$MI
 assert_contains "$MIGRATE_HOME/.codex/config.toml" 'request_max_retries = 7'
 assert_file "$MIGRATE_HOME/.codex/ccs-auth/.migrated-v2"
 assert_file "$MIGRATE_HOME/.codex/ccs-providers/.migrated-v3"
+assert_file "$MIGRATE_HOME/.codex/ccs-providers/.migrated-v4"
 assert_contains "$MIGRATE_HOME/.codex/ccs-providers/of.toml" '[model_providers.of]'
 assert_contains "$MIGRATE_HOME/.codex/ccs-providers/of.toml" 'request_max_retries = 7'
 assert_eq "$(basename "$(readlink "$MIGRATE_HOME/.codex/ccs-providers/current")" .toml)" "of"
@@ -357,6 +370,7 @@ assert_contains "$V3_HOME/.codex/config.toml" \
 assert_eq "$("$JQ_BIN" -er '.OPENAI_API_KEY | strings | select(length > 0)' "$V3_HOME/.codex/ccs-auth/proxy.json")" "proxy-key"
 assert_file "$V3_HOME/.codex/ccs-auth/.migrated-v2"
 assert_file "$V3_HOME/.codex/ccs-providers/.migrated-v3"
+assert_file "$V3_HOME/.codex/ccs-providers/.migrated-v4"
 assert_contains "$V3_HOME/.codex/ccs-providers/proxy.toml" '[model_providers.proxy]'
 
 # Fixed-provider migration: built-in OpenAI keeps ChatGPT OAuth and gains the constant table.
@@ -377,7 +391,8 @@ built_in_auth_hash="$(shasum -a 256 "$BUILTIN_HOME/.codex/auth.json" | cut -d' '
 assert_eq "$(HOME="$BUILTIN_HOME" bash "$CCS" codex current 2>/dev/null)" "openai"
 assert_contains "$BUILTIN_HOME/.codex/config.toml" 'model_provider = "ccs"'
 assert_contains "$BUILTIN_HOME/.codex/config.toml" '[model_providers.ccs]'
-assert_contains "$BUILTIN_HOME/.codex/config.toml" 'base_url = "https://chatgpt.com/backend-api/codex"'
+assert_not_contains "$BUILTIN_HOME/.codex/config.toml" 'base_url ='
+assert_not_contains "$BUILTIN_HOME/.codex/config.toml" 'wire_api ='
 assert_contains "$BUILTIN_HOME/.codex/config.toml" 'requires_openai_auth = true'
 assert_not_contains "$BUILTIN_HOME/.codex/config.toml" '[model_providers.ccs.auth]'
 assert_contains "$BUILTIN_HOME/.codex/config.toml" 'unified_exec = true'
@@ -385,6 +400,90 @@ assert_eq "$(shasum -a 256 "$BUILTIN_HOME/.codex/auth.json" | cut -d' ' -f1)" "$
 built_in_backup="$(find "$BUILTIN_HOME/.codex/ccs-backups" -type f -name config.toml -print -quit)"
 assert_file "$built_in_backup"
 assert_eq "$(stat -f '%Lp' "$built_in_backup")" "600"
+assert_file "$BUILTIN_HOME/.codex/ccs-providers/.migrated-v4"
+
+# v0.6.3 migration removes redundant OpenAI defaults and preserves a read-only backup.
+V4_HOME="$(mktemp -d)"
+mkdir -p "$V4_HOME/.codex/ccs-auth" "$V4_HOME/.codex/ccs-providers"
+printf '%s\n' \
+  'model_provider = "ccs"' \
+  'model = "gpt-v4"' \
+  '' \
+  '[features]' \
+  'unified_exec = true' \
+  '' \
+  '[model_providers.ccs]' \
+  'name = "OpenAI"' \
+  'base_url = "https://chatgpt.com/backend-api/codex"' \
+  'wire_api = "responses"' \
+  'requires_openai_auth = true' > "$V4_HOME/.codex/config.toml"
+printf '%s\n' \
+  '[model_providers.openai]' \
+  'name = "OpenAI"' \
+  'base_url = "https://chatgpt.com/backend-api/codex"' \
+  'wire_api = "responses"' \
+  'requires_openai_auth = true' > "$V4_HOME/.codex/ccs-providers/openai.toml"
+ln -s openai.toml "$V4_HOME/.codex/ccs-providers/current"
+jq -n '{auth_mode:"chatgpt",tokens:{refresh_token:"v4-refresh"}}' > "$V4_HOME/.codex/auth.json"
+cp "$V4_HOME/.codex/auth.json" "$V4_HOME/.codex/ccs-auth/openai.json"
+: > "$V4_HOME/.codex/ccs-auth/.migrated-v2"
+: > "$V4_HOME/.codex/ccs-providers/.migrated-v3"
+chmod 600 "$V4_HOME/.codex/auth.json" "$V4_HOME/.codex/ccs-auth/"* \
+  "$V4_HOME/.codex/ccs-providers/openai.toml" "$V4_HOME/.codex/ccs-providers/.migrated-v3"
+v4_auth_hash="$(shasum -a 256 "$V4_HOME/.codex/auth.json" | cut -d' ' -f1)"
+v4_non_provider_hash="$(config_without_provider_hash "$V4_HOME/.codex/config.toml")"
+assert_eq "$(HOME="$V4_HOME" bash "$CCS" codex current 2>/dev/null)" "openai"
+assert_file "$V4_HOME/.codex/ccs-providers/.migrated-v4"
+assert_not_contains "$V4_HOME/.codex/config.toml" 'base_url ='
+assert_not_contains "$V4_HOME/.codex/config.toml" 'wire_api ='
+assert_not_contains "$V4_HOME/.codex/ccs-providers/openai.toml" 'base_url ='
+assert_not_contains "$V4_HOME/.codex/ccs-providers/openai.toml" 'wire_api ='
+assert_contains "$V4_HOME/.codex/config.toml" 'name = "OpenAI"'
+assert_contains "$V4_HOME/.codex/config.toml" 'requires_openai_auth = true'
+assert_eq "$(config_without_provider_hash "$V4_HOME/.codex/config.toml")" "$v4_non_provider_hash"
+assert_eq "$(shasum -a 256 "$V4_HOME/.codex/auth.json" | cut -d' ' -f1)" "$v4_auth_hash"
+v4_backup="$(find "$V4_HOME/.codex/ccs-backups" -type d -name 'openai-defaults-*' -print -quit)"
+assert_file "$v4_backup/config.toml"
+assert_file "$v4_backup/openai.toml"
+assert_eq "$(stat -f '%Lp' "$v4_backup/config.toml")" "400"
+assert_eq "$(stat -f '%Lp' "$v4_backup/openai.toml")" "400"
+assert_contains "$v4_backup/config.toml" 'base_url = "https://chatgpt.com/backend-api/codex"'
+v4_config_hash="$(shasum -a 256 "$V4_HOME/.codex/config.toml" | cut -d' ' -f1)"
+v4_profile_hash="$(shasum -a 256 "$V4_HOME/.codex/ccs-providers/openai.toml" | cut -d' ' -f1)"
+v4_backup_count="$(find "$V4_HOME/.codex/ccs-backups" -type d -name 'openai-defaults-*' | wc -l | tr -d ' ')"
+assert_eq "$(HOME="$V4_HOME" bash "$CCS" codex current)" "openai"
+assert_eq "$(shasum -a 256 "$V4_HOME/.codex/config.toml" | cut -d' ' -f1)" "$v4_config_hash"
+assert_eq "$(shasum -a 256 "$V4_HOME/.codex/ccs-providers/openai.toml" | cut -d' ' -f1)" "$v4_profile_hash"
+assert_eq "$(find "$V4_HOME/.codex/ccs-backups" -type d -name 'openai-defaults-*' | wc -l | tr -d ' ')" "$v4_backup_count"
+
+# A failed v4 config replacement restores the old profile and leaves the migration retryable.
+V4_FAIL_HOME="$(mktemp -d)"
+V4_FAIL_BIN="$(mktemp -d)"
+mkdir -p "$V4_FAIL_HOME/.codex/ccs-auth" "$V4_FAIL_HOME/.codex/ccs-providers"
+cp "$ROOT/tests/fixtures/mv-fail-openai-defaults" "$V4_FAIL_BIN/mv"
+chmod +x "$V4_FAIL_BIN/mv"
+cp "$v4_backup/config.toml" "$V4_FAIL_HOME/.codex/config.toml"
+cp "$v4_backup/openai.toml" "$V4_FAIL_HOME/.codex/ccs-providers/openai.toml"
+ln -s openai.toml "$V4_FAIL_HOME/.codex/ccs-providers/current"
+cp "$V4_HOME/.codex/auth.json" "$V4_FAIL_HOME/.codex/auth.json"
+cp "$V4_HOME/.codex/ccs-auth/openai.json" "$V4_FAIL_HOME/.codex/ccs-auth/openai.json"
+: > "$V4_FAIL_HOME/.codex/ccs-auth/.migrated-v2"
+: > "$V4_FAIL_HOME/.codex/ccs-providers/.migrated-v3"
+chmod 600 "$V4_FAIL_HOME/.codex/config.toml" "$V4_FAIL_HOME/.codex/auth.json" \
+  "$V4_FAIL_HOME/.codex/ccs-auth/"* "$V4_FAIL_HOME/.codex/ccs-providers/openai.toml" \
+  "$V4_FAIL_HOME/.codex/ccs-providers/.migrated-v3"
+v4_fail_config_hash="$(shasum -a 256 "$V4_FAIL_HOME/.codex/config.toml" | cut -d' ' -f1)"
+v4_fail_profile_hash="$(shasum -a 256 "$V4_FAIL_HOME/.codex/ccs-providers/openai.toml" | cut -d' ' -f1)"
+if HOME="$V4_FAIL_HOME" PATH="$V4_FAIL_BIN:$PATH" bash "$CCS" codex current >/dev/null 2>&1; then
+  fail "v4 migration succeeded after the config replacement failed"
+fi
+assert_eq "$(shasum -a 256 "$V4_FAIL_HOME/.codex/config.toml" | cut -d' ' -f1)" "$v4_fail_config_hash"
+assert_eq "$(shasum -a 256 "$V4_FAIL_HOME/.codex/ccs-providers/openai.toml" | cut -d' ' -f1)" "$v4_fail_profile_hash"
+[[ ! -e "$V4_FAIL_HOME/.codex/ccs-providers/.migrated-v4" ]] \
+  || fail "failed v4 migration committed its marker"
+assert_no_ccs_temps "$V4_FAIL_HOME"
+assert_eq "$(HOME="$V4_FAIL_HOME" bash "$CCS" codex current 2>/dev/null)" "openai"
+assert_file "$V4_FAIL_HOME/.codex/ccs-providers/.migrated-v4"
 
 # Multiple legacy providers and nested tables become logical profiles; only the active one is materialized.
 NESTED_HOME="$(mktemp -d)"

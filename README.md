@@ -28,7 +28,7 @@ ccs list              List all profiles (* = active)
 ccs use deepseek      Switch profile (current terminal + persist)
 ccs env minimax       Source a profile in current terminal only
 ccs show              Show active profile (keys masked)
-ccs unset             Clear all Claude Code env vars
+ccs unset             Clear CCS env vars and use the official Claude login
 ccs statusline        List profiles with bound statuslines
 ccs statusline bind deepseek   Bind a statusline to a profile
 ccs statusline unbind deepseek Remove a statusline binding
@@ -91,6 +91,13 @@ up the change — a child process cannot modify its parent's environment.
 New terminals auto-restore the last `ccs use` profile via a symlink at
 `$CCS_STATE/current`.
 
+`ccs unset` is the official Claude subscription mode. It clears the union of
+all environment variables managed by CCS and every variable declared by the
+active profile, removes the active symlink, and leaves the saved profiles
+unchanged. Claude Code then uses its native OAuth login. CCS does not edit
+Claude credentials or unrelated settings, and it keeps the existing statusline
+binding pointed at an idle CCS statusline.
+
 ## Paths
 
 | Variable | Default | Purpose |
@@ -138,9 +145,12 @@ cannot be edited, renamed, or removed.
 Third-party profiles materialize a managed `[model_providers.ccs.auth]` table
 that reads their own `ccs-auth/<provider>.json`; they use
 `requires_openai_auth = false`, so ChatGPT OAuth tokens are not sent to their
-endpoints. The logical `openai` profile instead materializes the ChatGPT Codex
-endpoint with `wire_api = "responses"` and `requires_openai_auth = true`, with
-no third-party `.auth` table.
+endpoints. The logical `openai` profile materializes only `name = "OpenAI"`
+and `requires_openai_auth = true`, with no third-party `.auth` table. Codex
+selects the ChatGPT Codex endpoint from `auth.json` when `auth_mode` is
+`chatgpt`, and Responses is the default wire API when `wire_api` is omitted.
+The explicit auth flag remains necessary because custom providers default to
+no OpenAI authentication when it is omitted.
 
 For a new machine, create the official subscription credential through Codex's
 native browser login. CCS never handles the password or OAuth exchange itself;
@@ -174,6 +184,12 @@ fixed-ID conflict, malformed provider TOML, unusable active profile, lock
 conflict, or interruption leaves config, current, and credentials uncommitted
 or restored. Older `.env` profiles are still imported before this migration,
 and their timestamped read-only backup is retained.
+
+The first v0.6.3 command rewrites the reserved logical `openai` profile without
+the redundant `base_url` and `wire_api` fields. If OpenAI is active, the fixed
+`ccs` table is refreshed in the same transaction. The previous config and
+logical profile are retained in a mode-400 backup under `ccs-backups`, and the
+versioned migration marker makes subsequent commands idempotent.
 
 Codex files:
 

@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.3"
+VERSION="0.6.4"
 REPO="https://raw.githubusercontent.com/zzzhizhia/ccs/main"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -35,6 +35,8 @@ CODEX_TX_ACTIVE=0
 CODEX_TX_TARGETS=()
 CODEX_TX_BACKUPS=()
 CODEX_TX_CREATED_DIRS=()
+CODEX_LOGIN_RECOVERY_TARGETS=()
+CODEX_LOGIN_RECOVERY_BACKUPS=()
 
 mkdir -p "$CCS_DIR" "$CCS_STATE"
 
@@ -399,9 +401,46 @@ _codex_transaction_commit() {
   CODEX_TX_CREATED_DIRS=()
 }
 
+_codex_remove_path() {
+  local path="$1"
+  if [[ -d "$path" && ! -L "$path" ]]; then
+    rm -rf "$path"
+  else
+    rm -f "$path"
+  fi
+}
+
+_codex_login_recovery_restore() {
+  local index target backup
+  if [[ ${CODEX_LOGIN_RECOVERY_TARGETS[0]+_} ]]; then
+    for ((index=${#CODEX_LOGIN_RECOVERY_TARGETS[@]} - 1; index>=0; index--)); do
+      target="${CODEX_LOGIN_RECOVERY_TARGETS[$index]}"
+      backup="${CODEX_LOGIN_RECOVERY_BACKUPS[$index]}"
+      _codex_remove_path "$target" 2>/dev/null || true
+      if [[ -e "$backup" || -L "$backup" ]]; then
+        mv "$backup" "$target" 2>/dev/null || true
+      fi
+    done
+  fi
+  CODEX_LOGIN_RECOVERY_TARGETS=()
+  CODEX_LOGIN_RECOVERY_BACKUPS=()
+}
+
+_codex_login_recovery_discard() {
+  local backup
+  if [[ ${CODEX_LOGIN_RECOVERY_BACKUPS[0]+_} ]]; then
+    for backup in "${CODEX_LOGIN_RECOVERY_BACKUPS[@]}"; do
+      _codex_remove_path "$backup"
+    done
+  fi
+  CODEX_LOGIN_RECOVERY_TARGETS=()
+  CODEX_LOGIN_RECOVERY_BACKUPS=()
+}
+
 _codex_cleanup() {
   local file dir
   _codex_transaction_rollback
+  _codex_login_recovery_restore
   if [[ ${CODEX_TEMP_FILES[0]+_} ]]; then
     for file in "${CODEX_TEMP_FILES[@]}"; do rm -f "$file"; done
   fi
@@ -443,7 +482,9 @@ _codex_lock_release() {
     rmdir "$CODEX_LOCK" 2>/dev/null || true
     CODEX_LOCK_HELD=0
   fi
-  [[ ${CODEX_TEMP_FILES[0]+_} ]] || trap - EXIT HUP INT TERM
+  [[ ${CODEX_TEMP_FILES[0]+_} || ${CODEX_TEMP_DIRS[0]+_} \
+    || ${CODEX_LOGIN_RECOVERY_TARGETS[0]+_} || $CODEX_TX_ACTIVE -eq 1 ]] \
+    || trap - EXIT HUP INT TERM
 }
 
 _codex_validate_auth() {
@@ -468,6 +509,64 @@ _codex_auth_is_chatgpt() {
   local file="$1"
   [[ -f "$file" ]] \
     && jq -e '.auth_mode == "chatgpt" and (.tokens | type == "object")' "$file" >/dev/null 2>&1
+}
+
+_codex_auth_state() {
+  local file="$1"
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    echo missing
+    return 0
+  fi
+  if [[ ! -f "$file" ]]; then
+    echo invalid
+    return 0
+  fi
+  if jq -e '.auth_mode == "chatgpt" and (.tokens | type == "object")' "$file" >/dev/null 2>&1; then
+    echo chatgpt
+  elif jq -e '
+    .auth_mode == "apikey"
+    and (.OPENAI_API_KEY | type == "string" and length > 0)
+  ' "$file" >/dev/null 2>&1; then
+    echo apikey
+  else
+    echo invalid
+  fi
+}
+
+_codex_require_cli() {
+  local retry="${1:-ccs codex login}" binary
+  binary="$(type -P codex 2>/dev/null || true)"
+  if [[ -z "$binary" ]]; then
+    echo "ccs: Codex CLI not found in PATH" >&2
+    echo "  install on macOS: brew install codex" >&2
+    echo "  then retry: $retry" >&2
+    return 1
+  fi
+  printf '%s\n' "$binary"
+}
+
+_codex_require_openai_auth() {
+  local label="$1" file="$2" state binary
+  state="$(_codex_auth_state "$file")"
+  [[ "$state" == "chatgpt" ]] && return 0
+  echo "ccs: OpenAI ChatGPT login is unavailable ($label auth: $state)" >&2
+  binary="$(type -P codex 2>/dev/null || true)"
+  if [[ -z "$binary" ]]; then
+    echo "  install Codex CLI on macOS: brew install codex" >&2
+  fi
+  echo "  sign in: ccs codex login" >&2
+  exit 1
+}
+
+_codex_login_recovery_stage() {
+  local target="$1" backup
+  [[ -e "$target" || -L "$target" ]] || return 0
+  backup="$(mktemp "$CODEX_DIR/.ccs.login-recovery.XXXXXX")"
+  _codex_remove_path "$backup"
+  mv "$target" "$backup"
+  CODEX_LOGIN_RECOVERY_TARGETS+=("$target")
+  CODEX_LOGIN_RECOVERY_BACKUPS+=("$backup")
+  _codex_install_cleanup_trap
 }
 
 _codex_atomic_copy() {
@@ -1268,6 +1367,24 @@ _codex_prepare() {
   fi
 }
 
+_codex_prepare_for_login() {
+  local global_state snapshot_state
+  _codex_require_jq
+  _codex_init_dirs
+  if [[ ! -f "$CODEX_MIGRATION_MARKER" \
+    || ! -f "$CODEX_FIXED_MIGRATION_MARKER" \
+    || ! -f "$CODEX_OPENAI_DEFAULTS_MIGRATION_MARKER" ]]; then
+    global_state="$(_codex_auth_state "$CODEX_AUTH")"
+    snapshot_state="$(_codex_auth_state "$CODEX_AUTH_DIR/openai.json")"
+    [[ "$global_state" != "invalid" ]] || _codex_login_recovery_stage "$CODEX_AUTH"
+    case "$snapshot_state" in
+      missing|chatgpt) ;;
+      *) _codex_login_recovery_stage "$CODEX_AUTH_DIR/openai.json" ;;
+    esac
+  fi
+  _codex_prepare
+}
+
 _codex_read_secret() {
   local prompt="$1" value
   if [[ -t 0 ]]; then
@@ -1280,9 +1397,10 @@ _codex_read_secret() {
 }
 
 _codex_native_login() {
-  local binary config_tmp current_tmp
-  binary="$(type -P codex 2>/dev/null || true)"
-  [[ -n "$binary" ]] || die "Codex CLI not found; install it before creating an OpenAI subscription login"
+  local binary="${1:-}" config_tmp current_tmp
+  if [[ -z "$binary" ]]; then
+    binary="$(_codex_require_cli 'ccs codex login')" || exit 1
+  fi
 
   _codex_lock_acquire
   _codex_provider_exists openai || die "built-in OpenAI logical provider is missing"
@@ -1318,20 +1436,21 @@ cmd_codex_current() { _codex_prepare; _codex_current_raw; }
 
 cmd_codex_list() {
   _codex_prepare
-  local current name max=0
+  local current name auth_state max=0
   local names=()
   current="$(_codex_current_raw)"
   while IFS= read -r name; do names+=("$name"); ((${#name} > max)) && max=${#name}; done < <(_codex_provider_names)
   for name in "${names[@]}"; do
+    auth_state="$(_codex_auth_state "$CODEX_AUTH_DIR/$name.json")"
     printf '  %-*s  %s%s\n' "$max" "$name" \
       "$([[ "$name" == "$current" ]] && echo '* active' || echo '        ')" \
-      "$([[ -f "$CODEX_AUTH_DIR/$name.json" ]] && echo '  auth: saved' || echo '  auth: missing')"
+      "  auth: $auth_state"
   done
 }
 
 cmd_codex_show() {
   _codex_prepare
-  local name="${1:-}" snapshot
+  local name="${1:-}" snapshot auth_state
   name="${name:-$(_codex_current_raw)}"
   snapshot="$CODEX_AUTH_DIR/$name.json"
   _codex_provider_exists "$name" || die "Codex provider '$name' not found"
@@ -1342,24 +1461,23 @@ cmd_codex_show() {
     echo "base_url: $(_codex_provider_field "$name" base_url)"
     echo "wire_api: $(_codex_provider_field "$name" wire_api)"
   fi
-  if [[ -f "$snapshot" ]]; then
-    _codex_validate_auth "$snapshot"
-    echo "auth:     $(jq -r '.auth_mode' "$snapshot")"
-    [[ "$(jq -r 'has("OPENAI_API_KEY") and (.OPENAI_API_KEY != null and .OPENAI_API_KEY != "")' "$snapshot")" == true ]] && echo "api_key:  ***"
-    [[ "$(jq -r 'has("tokens") and (.tokens != null)' "$snapshot")" == true ]] && echo "tokens:   saved"
-  else
-    echo "auth:     missing"
-  fi
+  auth_state="$(_codex_auth_state "$snapshot")"
+  echo "auth:     $auth_state"
+  [[ "$auth_state" == "apikey" ]] && echo "api_key:  ***"
+  [[ "$auth_state" == "chatgpt" ]] && echo "tokens:   saved"
   return 0
 }
 
 cmd_codex_new() {
-  _codex_prepare
-  local provider="${1:-}" key fragment auth_tmp profile
+  local provider="${1:-}" key fragment auth_tmp profile binary=""
   [[ -n "$provider" ]] || die "usage: ccs codex new <provider>"
   if [[ "$provider" == "openai" ]]; then
+    binary="$(_codex_require_cli 'ccs codex new openai')" || exit 1
+  fi
+  _codex_prepare
+  if [[ "$provider" == "openai" ]]; then
     [[ ! -f "$CODEX_AUTH_DIR/openai.json" ]] || die "OpenAI auth is already managed; run 'ccs codex login' to sign in again"
-    _codex_native_login
+    _codex_native_login "$binary"
     return 0
   fi
   [[ "$provider" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ && "$provider" != "ccs" ]] \
@@ -1404,11 +1522,8 @@ cmd_codex_use() {
   _codex_provider_exists "$target" || die "Codex provider '$target' not found"
   profile="$(_codex_provider_path "$target")"
   if [[ "$target" == "openai" ]]; then
-    _codex_validate_auth "$CODEX_AUTH_DIR/openai.json"
-    _codex_auth_is_chatgpt "$CODEX_AUTH_DIR/openai.json" \
-      || die "OpenAI snapshot is not a ChatGPT login; run 'ccs codex login'"
-    _codex_auth_is_chatgpt "$CODEX_AUTH" \
-      || die "global ChatGPT login is unavailable; run 'ccs codex login'"
+    _codex_require_openai_auth snapshot "$CODEX_AUTH_DIR/openai.json"
+    _codex_require_openai_auth global "$CODEX_AUTH"
   else
     _codex_validate_provider_auth "$CODEX_AUTH_DIR/$target.json"
     _codex_validate_provider_fragment "$target" "$profile"
@@ -1417,10 +1532,8 @@ cmd_codex_use() {
   _codex_lock_acquire
   _codex_provider_exists "$target" || die "Codex provider '$target' not found"
   if [[ "$target" == "openai" ]]; then
-    _codex_auth_is_chatgpt "$CODEX_AUTH_DIR/openai.json" \
-      || die "OpenAI snapshot is not a ChatGPT login; run 'ccs codex login'"
-    _codex_auth_is_chatgpt "$CODEX_AUTH" \
-      || die "global ChatGPT login is unavailable; run 'ccs codex login'"
+    _codex_require_openai_auth snapshot "$CODEX_AUTH_DIR/openai.json"
+    _codex_require_openai_auth global "$CODEX_AUTH"
   else
     _codex_validate_provider_auth "$CODEX_AUTH_DIR/$target.json"
     _codex_validate_provider_fragment "$target" "$profile"
@@ -1582,8 +1695,101 @@ cmd_codex_removed() {
 }
 
 cmd_codex_login() {
-  _codex_prepare
-  _codex_native_login
+  local binary
+  binary="$(_codex_require_cli 'ccs codex login')" || exit 1
+  _codex_prepare_for_login
+  _codex_native_login "$binary"
+  _codex_login_recovery_discard
+}
+
+_codex_doctor_current() {
+  local link name current
+  if [[ -L "$CODEX_PROVIDER_CURRENT" ]]; then
+    link="$(readlink "$CODEX_PROVIDER_CURRENT" 2>/dev/null || true)"
+    name="$(basename "$link" .toml)"
+    if [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ && "$link" == *.toml \
+      && -f "$CODEX_PROVIDER_DIR/$name.toml" ]]; then
+      echo "$name"
+      return 0
+    fi
+    echo invalid
+    return 0
+  fi
+  if [[ -f "$CODEX_CONFIG" ]]; then
+    current="$(sed -nE 's/^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"([A-Za-z_][A-Za-z0-9_-]*)"[[:space:]]*$/\1/p' "$CODEX_CONFIG" | head -n 1)"
+    echo "${current:-openai}"
+  else
+    echo uninitialized
+  fi
+}
+
+cmd_codex_doctor() {
+  local jq_path codex_path current current_auth_state snapshot_state global_state
+  local login_state migration_state action_recommended=0
+  jq_path="$(type -P jq 2>/dev/null || true)"
+  codex_path="$(type -P codex 2>/dev/null || true)"
+  current="$(_codex_doctor_current)"
+  if [[ -n "$jq_path" ]]; then
+    snapshot_state="$(_codex_auth_state "$CODEX_AUTH_DIR/openai.json")"
+    global_state="$(_codex_auth_state "$CODEX_AUTH")"
+    case "$current" in
+      uninitialized|invalid|ccs) current_auth_state=unchecked ;;
+      *) current_auth_state="$(_codex_auth_state "$CODEX_AUTH_DIR/$current.json")" ;;
+    esac
+  else
+    current_auth_state=unchecked
+    snapshot_state=unchecked
+    global_state=unchecked
+  fi
+  if [[ "$snapshot_state" == "chatgpt" && "$global_state" == "chatgpt" ]]; then
+    login_state=ready
+  elif [[ "$snapshot_state" == "invalid" || "$global_state" == "invalid" ]]; then
+    login_state=invalid
+  else
+    login_state=missing
+  fi
+  if [[ -f "$CODEX_MIGRATION_MARKER" \
+    && -f "$CODEX_FIXED_MIGRATION_MARKER" \
+    && -f "$CODEX_OPENAI_DEFAULTS_MIGRATION_MARKER" ]]; then
+    migration_state=ready
+  else
+    migration_state=pending
+  fi
+
+  printf 'CCS version:       %s\n' "$VERSION"
+  printf 'jq:                %s\n' "${jq_path:-missing}"
+  printf 'Codex CLI:         %s\n' "${codex_path:-missing}"
+  printf 'Current provider:  %s\n' "$current"
+  printf 'Current auth:      %s\n' "$current_auth_state"
+  printf 'OpenAI login:      %s\n' "$login_state"
+  printf '  global auth:     %s\n' "$global_state"
+  printf '  saved snapshot:  %s\n' "$snapshot_state"
+  printf 'Migrations:        %s\n' "$migration_state"
+  echo "Recommended action:"
+  if [[ -z "$jq_path" ]]; then
+    echo "  brew install jq"
+    action_recommended=1
+  fi
+  if [[ "$current" != "openai" && "$current" != "uninitialized" \
+    && "$current" != "invalid" && "$current" != "ccs" \
+    && "$current_auth_state" != "apikey" ]]; then
+    echo "  ccs codex edit $current"
+    action_recommended=1
+  fi
+  if [[ "$login_state" != "ready" ]]; then
+    if [[ -z "$codex_path" ]]; then
+      echo "  brew install codex"
+    fi
+    echo "  ccs codex login"
+    action_recommended=1
+  fi
+  if [[ "$migration_state" == "pending" && "$login_state" == "ready" ]]; then
+    echo "  ccs codex list"
+    action_recommended=1
+  fi
+  if ((action_recommended == 0)); then
+    echo "  none"
+  fi
 }
 
 cmd_codex_help() {
@@ -1601,6 +1807,7 @@ Usage:
   ccs codex rename <old> <new> Rename a provider and its saved auth
   ccs codex rm <name>         Remove an inactive provider
   ccs codex show [<name>]     Show provider metadata (secrets masked)
+  ccs codex doctor            Diagnose dependencies, providers, and auth
 
 Files:
   Fixed config:     $CODEX_CONFIG
@@ -1620,6 +1827,7 @@ cmd_codex() {
     edit|e) cmd_codex_edit "$@" ;; rename|ren) cmd_codex_rename "$@" ;;
     rm|remove) cmd_codex_rm "$@" ;;
     show) cmd_codex_show "$@" ;;
+    doctor) cmd_codex_doctor ;;
     env|source|src|unset|off|path) cmd_codex_removed "$sub" ;;
     help|-h|--help) cmd_codex_help ;; *) die "ccs codex: unknown command '$sub'" ;;
   esac

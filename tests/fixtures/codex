@@ -3,6 +3,11 @@ set -euo pipefail
 
 if [[ "${1:-}" == "login" ]]; then
   mkdir -p "$HOME/.codex"
+  if [[ "${CCS_TEST_CODEX_LOGIN_FAIL:-0}" == "1" ]]; then
+    printf '{"auth_mode":"chatgpt","tokens":' > "$HOME/.codex/auth.json"
+    echo "Login cancelled" >&2
+    exit 1
+  fi
   jq -n '{auth_mode:"chatgpt",OPENAI_API_KEY:null,tokens:{access_token:"native-access",id_token:"native-id",refresh_token:"native-refresh",account_id:"native-account"}}' \
     > "$HOME/.codex/auth.json"
   chmod 600 "$HOME/.codex/auth.json"

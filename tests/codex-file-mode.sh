@@ -85,7 +85,7 @@ chmod 600 "$TEST_HOME/.codex/auth.json"
 chatgpt_auth_hash="$(shasum -a 256 "$TEST_HOME/.codex/auth.json" | cut -d' ' -f1)"
 
 HOME="$TEST_HOME" bash "$CCS" codex list >/dev/null
-assert_eq "$(bash "$CCS" version)" "ccs 0.6.3"
+assert_eq "$(bash "$CCS" version)" "ccs 0.6.4"
 assert_file "$TEST_HOME/.codex/ccs-auth/openai.json"
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/ccs-auth/openai.json")" "refresh"
 assert_file "$TEST_HOME/.codex/ccs-auth/.migrated-v2"
@@ -111,6 +111,14 @@ assert_eq "$("$JQ_BIN" -er '.OPENAI_API_KEY | strings | select(length > 0)' "$TE
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/auth.json")" "refresh"
 assert_eq "$(stat -f '%Lp' "$TEST_HOME/.codex/ccs-auth/proxy.json")" "600"
 assert_eq "$(stat -f '%Lp' "$TEST_HOME/.codex/ccs-auth")" "700"
+list_output="$(HOME="$TEST_HOME" bash "$CCS" codex list)"
+grep -Eq 'openai.*auth: chatgpt' <<< "$list_output" \
+  || fail "list did not classify ChatGPT auth"
+grep -Eq 'proxy.*auth: apikey' <<< "$list_output" \
+  || fail "list did not classify provider API key auth"
+show_output="$(HOME="$TEST_HOME" bash "$CCS" codex show proxy)"
+grep -qF 'auth:     apikey' <<< "$show_output" \
+  || fail "show did not classify provider API key auth"
 
 non_provider_hash="$(config_without_provider_hash "$TEST_HOME/.codex/config.toml")"
 for logical in proxy openai proxy; do
@@ -128,6 +136,19 @@ assert_eq "$(jq -r '.auth_mode' "$TEST_HOME/.codex/auth.json")" "chatgpt"
 assert_eq "$(jq -r '.tokens.refresh_token' "$TEST_HOME/.codex/auth.json")" "refresh"
 assert_contains "$TEST_HOME/.codex/config.toml" 'model = "gpt-test"'
 assert_contains "$TEST_HOME/.codex/config.toml" 'unified_exec = true'
+doctor_output="$(HOME="$TEST_HOME" bash "$CCS" codex doctor)"
+grep -qF 'Current provider:  proxy' <<< "$doctor_output" \
+  || fail "doctor did not report the active third-party provider"
+grep -qF 'Current auth:      apikey' <<< "$doctor_output" \
+  || fail "doctor did not report healthy third-party auth"
+grep -qF '  none' <<< "$doctor_output" \
+  || fail "doctor did not recognize a healthy third-party provider"
+if grep -qF 'ccs codex use openai' <<< "$doctor_output"; then
+  fail "doctor tried to replace an intentionally active third-party provider"
+fi
+if grep -qF 'proxy-key' <<< "$doctor_output"; then
+  fail "doctor exposed a provider API key"
+fi
 if CODEX_BIN="$(type -P codex 2>/dev/null)" && [[ -n "$CODEX_BIN" ]]; then
   CODEX_HOME="$TEST_HOME/.codex" "$CODEX_BIN" login status 2>&1 | grep -qi 'ChatGPT' \
     || fail "real Codex CLI did not preserve ChatGPT auth with a custom provider"
@@ -669,6 +690,137 @@ assert_eq "$(shasum -a 256 "$INTERRUPT_HOME/.codex/config.toml" | cut -d' ' -f1)
 assert_eq "$(shasum -a 256 "$INTERRUPT_HOME/.codex/auth.json" | cut -d' ' -f1)" "$interrupt_auth_hash"
 [[ ! -e "$INTERRUPT_HOME/.codex/ccs-providers" ]] || fail "interrupted migration left a provider directory"
 assert_no_ccs_temps "$INTERRUPT_HOME"
+
+# Missing CLI errors are actionable and do not initialize Codex state.
+MISSING_CLI_HOME="$(mktemp -d)"
+if missing_cli_output="$(
+  HOME="$MISSING_CLI_HOME" PATH="/usr/bin:/bin" bash "$CCS" codex login 2>&1
+)"; then
+  fail "Codex login succeeded without the Codex CLI"
+fi
+grep -qF 'Codex CLI not found in PATH' <<< "$missing_cli_output" \
+  || fail "missing CLI error did not identify PATH"
+grep -qF 'brew install codex' <<< "$missing_cli_output" \
+  || fail "missing CLI error did not include the install command"
+grep -qF 'ccs codex login' <<< "$missing_cli_output" \
+  || fail "missing CLI error did not include the retry command"
+[[ ! -e "$MISSING_CLI_HOME/.codex" ]] \
+  || fail "missing CLI preflight initialized Codex state"
+
+# Doctor reports an uninitialized machine without creating Codex files.
+DOCTOR_HOME="$(mktemp -d)"
+doctor_output="$(HOME="$DOCTOR_HOME" PATH="/usr/bin:/bin" bash "$CCS" codex doctor)"
+grep -qF 'Current provider:  uninitialized' <<< "$doctor_output" \
+  || fail "doctor did not report uninitialized Codex state"
+grep -qF 'brew install codex' <<< "$doctor_output" \
+  || fail "doctor did not recommend the missing Codex CLI"
+[[ ! -e "$DOCTOR_HOME/.codex" ]] || fail "doctor modified Codex state"
+
+# Missing and malformed OpenAI auth are diagnosed without treating an empty file as saved.
+AUTH_DIAG_HOME="$(mktemp -d)"
+if use_output="$(HOME="$AUTH_DIAG_HOME" bash "$CCS" codex use openai 2>&1)"; then
+  fail "OpenAI switch succeeded without auth"
+fi
+grep -qF 'snapshot auth: missing' <<< "$use_output" \
+  || fail "missing OpenAI snapshot state was not reported"
+grep -qF 'ccs codex login' <<< "$use_output" \
+  || fail "missing OpenAI snapshot error did not include the login command"
+list_output="$(HOME="$AUTH_DIAG_HOME" bash "$CCS" codex list)"
+grep -Eq 'openai.*auth: missing' <<< "$list_output" \
+  || fail "list did not report missing OpenAI auth"
+show_output="$(HOME="$AUTH_DIAG_HOME" bash "$CCS" codex show openai)"
+grep -qF 'auth:     missing' <<< "$show_output" \
+  || fail "show did not report missing OpenAI auth"
+
+: > "$AUTH_DIAG_HOME/.codex/ccs-auth/openai.json"
+list_output="$(HOME="$AUTH_DIAG_HOME" bash "$CCS" codex list)"
+grep -Eq 'openai.*auth: invalid' <<< "$list_output" \
+  || fail "list treated an empty OpenAI auth file as saved"
+show_output="$(HOME="$AUTH_DIAG_HOME" bash "$CCS" codex show openai)"
+grep -qF 'auth:     invalid' <<< "$show_output" \
+  || fail "show did not report invalid OpenAI auth"
+if use_output="$(HOME="$AUTH_DIAG_HOME" bash "$CCS" codex use openai 2>&1)"; then
+  fail "OpenAI switch succeeded with invalid auth"
+fi
+grep -qF 'snapshot auth: invalid' <<< "$use_output" \
+  || fail "invalid OpenAI snapshot state was not reported"
+grep -qF 'ccs codex login' <<< "$use_output" \
+  || fail "invalid OpenAI snapshot error did not include the login command"
+doctor_output="$(HOME="$AUTH_DIAG_HOME" bash "$CCS" codex doctor)"
+grep -qF 'OpenAI login:      invalid' <<< "$doctor_output" \
+  || fail "doctor did not report invalid OpenAI login"
+grep -qF 'ccs codex login' <<< "$doctor_output" \
+  || fail "doctor did not recommend login"
+
+# Ready credentials with pending migrations produce a migration action.
+DOCTOR_PENDING_HOME="$(mktemp -d)"
+mkdir -p "$DOCTOR_PENDING_HOME/.codex/ccs-auth"
+printf '%s\n' 'model_provider = "openai"' > "$DOCTOR_PENDING_HOME/.codex/config.toml"
+jq -n '{auth_mode:"chatgpt",tokens:{refresh_token:"pending-refresh"}}' \
+  > "$DOCTOR_PENDING_HOME/.codex/auth.json"
+cp "$DOCTOR_PENDING_HOME/.codex/auth.json" \
+  "$DOCTOR_PENDING_HOME/.codex/ccs-auth/openai.json"
+doctor_output="$(HOME="$DOCTOR_PENDING_HOME" bash "$CCS" codex doctor)"
+grep -qF 'OpenAI login:      ready' <<< "$doctor_output" \
+  || fail "doctor did not recognize ready pre-migration auth"
+grep -qF 'Migrations:        pending' <<< "$doctor_output" \
+  || fail "doctor did not report pending migrations"
+grep -qF 'ccs codex list' <<< "$doctor_output" \
+  || fail "doctor did not recommend initializing pending migrations"
+if grep -qF '  none' <<< "$doctor_output"; then
+  fail "doctor recommended no action while migrations were pending"
+fi
+[[ ! -e "$DOCTOR_PENDING_HOME/.codex/ccs-providers" ]] \
+  || fail "doctor initialized pending provider metadata"
+
+# Login repairs malformed auth even when migration has not started.
+RECOVERY_HOME="$(mktemp -d)"
+RECOVERY_BIN="$(mktemp -d)"
+mkdir -p "$RECOVERY_HOME/.codex/ccs-auth"
+: > "$RECOVERY_HOME/.codex/ccs-auth/openai.json"
+cp "$ROOT/tests/fixtures/codex" "$RECOVERY_BIN/codex"
+chmod +x "$RECOVERY_BIN/codex"
+HOME="$RECOVERY_HOME" PATH="$RECOVERY_BIN:$PATH" bash "$CCS" codex login >/dev/null
+assert_eq "$(jq -r '.auth_mode' "$RECOVERY_HOME/.codex/auth.json")" "chatgpt"
+assert_eq "$(jq -r '.tokens.refresh_token' "$RECOVERY_HOME/.codex/ccs-auth/openai.json")" "native-refresh"
+assert_eq "$(HOME="$RECOVERY_HOME" bash "$CCS" codex current)" "openai"
+assert_file "$RECOVERY_HOME/.codex/ccs-auth/.migrated-v2"
+assert_file "$RECOVERY_HOME/.codex/ccs-providers/.migrated-v4"
+doctor_output="$(HOME="$RECOVERY_HOME" PATH="$RECOVERY_BIN:$PATH" bash "$CCS" codex doctor)"
+grep -qF 'OpenAI login:      ready' <<< "$doctor_output" \
+  || fail "doctor did not report a ready OpenAI login"
+grep -qF 'Current auth:      chatgpt' <<< "$doctor_output" \
+  || fail "doctor did not report current ChatGPT auth"
+grep -qF 'Migrations:        ready' <<< "$doctor_output" \
+  || fail "doctor did not report completed migrations"
+if grep -qF 'native-refresh' <<< "$doctor_output"; then
+  fail "doctor exposed an OAuth token"
+fi
+
+# Login also replaces a directory at the auth snapshot path with a regular file.
+DIRECTORY_AUTH_HOME="$(mktemp -d)"
+mkdir -p "$DIRECTORY_AUTH_HOME/.codex/ccs-auth/openai.json"
+HOME="$DIRECTORY_AUTH_HOME" PATH="$RECOVERY_BIN:$PATH" bash "$CCS" codex login >/dev/null
+[[ -f "$DIRECTORY_AUTH_HOME/.codex/ccs-auth/openai.json" \
+  && ! -d "$DIRECTORY_AUTH_HOME/.codex/ccs-auth/openai.json" ]] \
+  || fail "login did not replace a directory-shaped OpenAI snapshot"
+assert_eq "$(jq -r '.auth_mode' "$DIRECTORY_AUTH_HOME/.codex/ccs-auth/openai.json")" "chatgpt"
+assert_no_ccs_temps "$DIRECTORY_AUTH_HOME"
+
+# A cancelled native login rolls back partial auth and provider state changes.
+recovery_config_hash="$(shasum -a 256 "$RECOVERY_HOME/.codex/config.toml" | cut -d' ' -f1)"
+recovery_auth_hash="$(shasum -a 256 "$RECOVERY_HOME/.codex/auth.json" | cut -d' ' -f1)"
+recovery_snapshot_hash="$(shasum -a 256 "$RECOVERY_HOME/.codex/ccs-auth/openai.json" | cut -d' ' -f1)"
+recovery_current="$(readlink "$RECOVERY_HOME/.codex/ccs-providers/current")"
+if HOME="$RECOVERY_HOME" PATH="$RECOVERY_BIN:$PATH" CCS_TEST_CODEX_LOGIN_FAIL=1 \
+  bash "$CCS" codex login >/dev/null 2>&1; then
+  fail "cancelled Codex login unexpectedly succeeded"
+fi
+assert_eq "$(shasum -a 256 "$RECOVERY_HOME/.codex/config.toml" | cut -d' ' -f1)" "$recovery_config_hash"
+assert_eq "$(shasum -a 256 "$RECOVERY_HOME/.codex/auth.json" | cut -d' ' -f1)" "$recovery_auth_hash"
+assert_eq "$(shasum -a 256 "$RECOVERY_HOME/.codex/ccs-auth/openai.json" | cut -d' ' -f1)" "$recovery_snapshot_hash"
+assert_eq "$(readlink "$RECOVERY_HOME/.codex/ccs-providers/current")" "$recovery_current"
+assert_no_ccs_temps "$RECOVERY_HOME"
 
 # A brand-new user can create an official subscription credential through the native login.
 NEW_USER_HOME="$(mktemp -d)"

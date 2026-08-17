@@ -2,6 +2,31 @@
 
 All notable changes to CCS are documented in this file.
 
+## [0.6.4] - 2026-08-17
+
+### Added
+
+- Added `ccs codex doctor` for read-only dependency, provider, migration, and
+  masked authentication diagnostics with executable remediation commands.
+- Added distinct `missing`, `invalid`, `chatgpt`, and `apikey` credential
+  states to Codex provider listing and inspection.
+
+### Fixed
+
+- Made missing and malformed OpenAI credentials direct users to install the
+  standalone Codex CLI when necessary and run `ccs codex login`.
+- Allowed native login to recover an invalid OpenAI credential safely before
+  migration, while preserving transaction rollback on cancelled login.
+- Checked for the Codex CLI before initializing or migrating Codex state during
+  official login.
+
+### Validation
+
+- Added regression coverage for missing CLI installation guidance, missing,
+  empty, and directory-shaped credentials, pre-migration login recovery,
+  doctor recommendations, and rollback after a native login writes partial
+  authentication state and fails.
+
 ## [0.6.3] - 2026-08-08
 
 ### Changed
@@ -63,6 +88,7 @@ All notable changes to CCS are documented in this file.
   byte-preserving switches, migration conflicts, lock contention, interrupted
   commits, credential preservation, and active/inactive rename behavior.
 
+[0.6.4]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.4
 [0.6.3]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.3
 [0.6.2]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.2
 [0.6.1]: https://github.com/zzzhizhia/ccs/releases/tag/v0.6.1

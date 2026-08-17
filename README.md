@@ -41,8 +41,9 @@ ccs codex login       Sign in to OpenAI again and refresh its snapshot
 ccs codex use proxy   Switch providers while keeping ChatGPT signed in
 ccs codex edit proxy  Edit provider TOML, then optionally rotate its API key
 ccs codex rename proxy gateway  Rename a provider and its saved auth
-ccs codex list        List providers and saved credentials
+ccs codex list        List providers and credential states
 ccs codex show proxy  Show provider metadata with secrets masked
+ccs codex doctor      Diagnose dependencies, providers, and auth
 ```
 
 Short aliases: `ls`, `c`, `sw`, `e`, `ren`, `rm`, `source`, `src`, `off`.
@@ -156,6 +157,17 @@ For a new machine, create the official subscription credential through Codex's
 native browser login. CCS never handles the password or OAuth exchange itself;
 after Codex finishes, CCS validates `auth.json` and stores the complete login:
 
+The standalone Codex CLI must be available in `PATH` for official ChatGPT
+login. The ChatGPT desktop app keeps its own application session and does not
+install the terminal command. On macOS, install the CLI first when needed:
+
+```bash
+brew install codex
+```
+
+Third-party providers continue to use their own saved API keys and do not need
+the standalone CLI merely to switch profiles.
+
 ```bash
 ccs codex new openai
 ```
@@ -164,6 +176,13 @@ Use `ccs codex login` later to sign in again or refresh the managed OpenAI
 credential. Native login runs with a process-only `model_provider="openai"`
 override. After it exits, the on-disk config is immediately materialized back
 to the fixed `ccs` ID and the logical `openai` profile becomes active.
+Missing or malformed OpenAI snapshots are repaired by `ccs codex login`; do
+not create `openai.json` manually. If the Codex desktop app is already open,
+quit and reopen it after login so it reloads the updated config and credential.
+
+`ccs codex doctor` is read-only and prints the CCS version, dependency paths,
+current logical provider, migration state, masked credential states, and the
+next recommended command. It never prints API keys or OAuth tokens.
 
 ```bash
 ccs codex new proxy
